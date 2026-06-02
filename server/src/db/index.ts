@@ -162,6 +162,17 @@ function createTables(db: Database.Database) {
 
   ensureRequestKeyIdColumn(db);
   ensureApiKeysBaseUrlColumn(db);
+  ensureRequestTtfbColumn(db);
+}
+
+// `ttfb_ms` is the time-to-first-byte for streaming responses (ms from dispatch
+// to the first chunk). NULL for non-streaming or pre-existing rows. Feeds the
+// bandit router's latency axis (server/src/services/scoring.ts).
+function ensureRequestTtfbColumn(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'ttfb_ms')) {
+    db.prepare('ALTER TABLE requests ADD COLUMN ttfb_ms INTEGER').run();
+  }
 }
 
 function ensureRequestKeyIdColumn(db: Database.Database) {
@@ -1373,4 +1384,19 @@ export function regenerateUnifiedKey(): string {
   const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
   db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
   return key;
+}
+
+// Generic key/value settings accessors (used by routing strategy, etc.).
+export function getSetting(key: string): string | undefined {
+  const db = getDb();
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setSetting(key: string, value: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
 }

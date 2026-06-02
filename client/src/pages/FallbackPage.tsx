@@ -136,6 +136,149 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
   )
 }
 
+// ── Bandit routing strategy ─────────────────────────────────────────────────
+type RoutingStrategy = 'priority' | 'balanced' | 'smartest' | 'fastest' | 'reliable'
+
+interface RoutingScore {
+  modelDbId: number
+  platform: string
+  modelId: string
+  displayName: string
+  enabled: boolean
+  reliability: number
+  speed: number
+  intelligence: number
+  headroom: number
+  rateLimit: number
+  score: number
+  totalRequests: number
+}
+
+interface RoutingData {
+  strategy: RoutingStrategy
+  weights: { reliability: number; speed: number; intelligence: number } | null
+  scores: RoutingScore[]
+}
+
+const STRATEGIES: { key: RoutingStrategy; label: string; blurb: string }[] = [
+  { key: 'priority', label: 'Manual', blurb: 'Use the hand-ordered chain below (no scoring).' },
+  { key: 'balanced', label: 'Balanced', blurb: 'Reliability leads; speed and intelligence split the rest.' },
+  { key: 'smartest', label: 'Smartest', blurb: 'Prefer the most capable model that still works.' },
+  { key: 'fastest', label: 'Fastest', blurb: 'Prefer the fastest model that still works.' },
+  { key: 'reliable', label: 'Most reliable', blurb: 'Maximize success rate above all.' },
+]
+
+// A 0..1 value as a thin horizontal bar with the number beside it.
+function AxisBar({ value, color }: { value: number; color: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="h-1.5 w-12 rounded-full bg-muted overflow-hidden">
+        <div className="h-full rounded-full" style={{ width: `${Math.round(value * 100)}%`, backgroundColor: color }} />
+      </div>
+      <span className="font-mono text-[11px] text-muted-foreground tabular-nums w-7 text-right">
+        {Math.round(value * 100)}
+      </span>
+    </div>
+  )
+}
+
+function RoutingPanel({
+  data,
+  onSelect,
+  pending,
+}: {
+  data: RoutingData
+  onSelect: (s: RoutingStrategy) => void
+  pending: boolean
+}) {
+  const active = STRATEGIES.find(s => s.key === data.strategy) ?? STRATEGIES[0]
+  const banditOn = data.strategy !== 'priority'
+  // Only show models that have been observed or are enabled, ranked by score.
+  const rows = data.scores.filter(s => s.enabled || s.totalRequests > 0)
+
+  return (
+    <section className="rounded-lg border bg-card p-5">
+      <div className="flex items-baseline justify-between mb-1">
+        <h2 className="text-sm font-medium">Routing strategy</h2>
+        <span className="text-xs text-muted-foreground">{active.blurb}</span>
+      </div>
+
+      <div className="mt-3 inline-flex flex-wrap gap-1 rounded-lg border p-1">
+        {STRATEGIES.map(s => (
+          <button
+            key={s.key}
+            disabled={pending}
+            onClick={() => onSelect(s.key)}
+            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+              s.key === data.strategy
+                ? 'bg-foreground text-background font-medium'
+                : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+            }`}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+
+      {data.weights && (
+        <p className="mt-2 text-xs text-muted-foreground tabular-nums">
+          Weights — reliability {Math.round(data.weights.reliability * 100)}% ·
+          {' '}speed {Math.round(data.weights.speed * 100)}% ·
+          {' '}intelligence {Math.round(data.weights.intelligence * 100)}%
+        </p>
+      )}
+
+      {rows.length > 0 && (
+        <div className="mt-4 overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-muted-foreground border-b">
+                <th className="py-1.5 pr-3 font-medium">{banditOn ? '#' : ''}</th>
+                <th className="py-1.5 pr-3 font-medium">Model</th>
+                <th className="py-1.5 pr-3 font-medium">Reliability</th>
+                <th className="py-1.5 pr-3 font-medium">Speed</th>
+                <th className="py-1.5 pr-3 font-medium">Intelligence</th>
+                <th className="py-1.5 pr-3 font-medium" title="Free-quota headroom × rate-limit guardrails">Guardrails</th>
+                <th className="py-1.5 pr-3 font-medium text-right">Score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.modelDbId} className={`border-b last:border-0 ${r.enabled ? '' : 'opacity-40'}`}>
+                  <td className="py-1.5 pr-3 font-mono text-muted-foreground tabular-nums">{banditOn ? i + 1 : '·'}</td>
+                  <td className="py-1.5 pr-3">
+                    <span className="font-medium">{r.displayName}</span>
+                    <span className="ml-1.5 text-muted-foreground">{r.platform}</span>
+                    {r.totalRequests > 0 && (
+                      <span className="ml-1.5 text-muted-foreground/70">({r.totalRequests} obs)</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 pr-3"><AxisBar value={r.reliability} color="#22c55e" /></td>
+                  <td className="py-1.5 pr-3"><AxisBar value={r.speed} color="#3b82f6" /></td>
+                  <td className="py-1.5 pr-3"><AxisBar value={r.intelligence} color="#a855f7" /></td>
+                  <td className="py-1.5 pr-3 font-mono text-muted-foreground tabular-nums">
+                    {(r.headroom * r.rateLimit) < 0.999
+                      ? `×${(r.headroom * r.rateLimit).toFixed(2)}`
+                      : '—'}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right font-mono font-medium tabular-nums">
+                    {r.score.toFixed(3)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!banditOn && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Preview only — manual order (below) is active. Pick a strategy above to route by these scores.
+            </p>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function SortableModelRow({
   entry,
   index,
@@ -239,6 +382,22 @@ export default function FallbackPage() {
     },
   })
 
+  // Bandit routing: live per-model scores refresh on a short interval so the
+  // table reflects recent traffic without a manual reload.
+  const { data: routing } = useQuery<RoutingData>({
+    queryKey: ['fallback', 'routing'],
+    queryFn: () => apiFetch('/api/fallback/routing'),
+    refetchInterval: 15_000,
+  })
+
+  const strategyMutation = useMutation({
+    mutationFn: (strategy: RoutingStrategy) =>
+      apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify({ strategy }) }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
+    },
+  })
+
   const allEntries = localEntries ?? entries
   const displayEntries = allEntries.filter(e => e.keyCount > 0)
   const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
@@ -303,6 +462,14 @@ export default function FallbackPage() {
       />
 
       <div className="space-y-6">
+        {routing && (
+          <RoutingPanel
+            data={routing}
+            onSelect={(s) => strategyMutation.mutate(s)}
+            pending={strategyMutation.isPending}
+          />
+        )}
+
         {tokenUsage && tokenUsage.totalBudget > 0 && (
           <TokenUsageBar data={tokenUsage} />
         )}

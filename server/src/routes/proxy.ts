@@ -407,6 +407,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // instead of a silently truncated stream.
         let totalOutputTokens = 0;
         let streamStarted = false;
+        let ttfbMs: number | null = null;
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
@@ -415,6 +416,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
           for await (const chunk of gen) {
             if (!streamStarted) {
+              // Time-to-first-byte: dispatch → first chunk. Feeds the router's
+              // latency axis (server/src/services/scoring.ts).
+              ttfbMs = Date.now() - start;
               res.setHeader('Content-Type', 'text/event-stream');
               res.setHeader('Cache-Control', 'no-cache');
               res.setHeader('Connection', 'keep-alive');
@@ -438,7 +442,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs);
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
@@ -531,13 +535,14 @@ export function logRequest(
   outputTokens: number,
   latencyMs: number,
   error: string | null,
+  ttfbMs: number | null = null,
 ) {
   try {
     const db = getDb();
     db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error);
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs);
   } catch (e) {
     console.error('Failed to log request:', e);
   }
