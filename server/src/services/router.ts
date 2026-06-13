@@ -708,7 +708,7 @@ export interface RoutingScore {
   totalRequests: number; // decay-weighted observations
 }
 
-export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; scores: RoutingScore[] } {
+export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; scores: RoutingScore[] } {
   const db = getDb();
   const strategy = getRoutingStrategy();
   refreshStatsCache(db);
@@ -750,7 +750,11 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
     };
   }).sort((a, b) => b.score - a.score);
 
-  return { strategy, weights: weightsFor(strategy), scores };
+  // customWeights is always present (the saved vector, or the balanced default)
+  // so the dashboard's custom-weight sliders can render even before the user
+  // has saved their own — distinct from `weights`, which is null in priority
+  // mode and the active preset otherwise.
+  return { strategy, weights: weightsFor(strategy), customWeights: getCustomWeights(), scores };
 }
 
 // Whether at least one vision-capable model is enabled in the fallback chain.

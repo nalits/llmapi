@@ -100,11 +100,15 @@ function CustomWeightsPopover({ saved, onSave, saving }: {
   const [values, setValues] = useState<RoutingWeights>(() => fromSaved(saved))
   const [dirty, setDirty] = useState(false)
 
-  function fromSaved(w: RoutingWeights): RoutingWeights {
+  // Defensive: an older/partial server response (or a future field rename) could
+  // leave `saved` undefined; never let that white-screen the whole page (there's
+  // no error boundary above us). Fall back to an even split.
+  function fromSaved(w?: RoutingWeights): RoutingWeights {
+    const safe = w ?? { reliability: 1 / 3, speed: 1 / 3, intelligence: 1 / 3 }
     return {
-      reliability: Math.round(w.reliability * 100),
-      speed: Math.round(w.speed * 100),
-      intelligence: Math.round(w.intelligence * 100),
+      reliability: Math.round(safe.reliability * 100),
+      speed: Math.round(safe.speed * 100),
+      intelligence: Math.round(safe.intelligence * 100),
     }
   }
 

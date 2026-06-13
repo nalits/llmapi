@@ -7,7 +7,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy } from '../services/router.js';
+import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy, setCustomWeights } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
 import { parseBudget } from '../lib/budget.js';
 
@@ -21,16 +21,34 @@ fallbackRouter.get('/routing', (_req: Request, res: Response) => {
 });
 
 const routingSchema = z.object({
-  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable']),
+  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']),
+  // Only meaningful with strategy 'custom': the user's weight vector. Any
+  // non-negative vector is accepted; setCustomWeights renormalizes to sum 1.
+  weights: z.object({
+    reliability: z.number().nonnegative(),
+    speed: z.number().nonnegative(),
+    intelligence: z.number().nonnegative(),
+  }).optional(),
 });
 
 // PUT /routing → switch strategy. Presets are just weight vectors over the three
-// axes; 'priority' falls back to the legacy manual chain order.
+// axes; 'priority' falls back to the legacy manual chain order; 'custom' uses
+// the user's saved weights (optionally updated in the same request).
 fallbackRouter.put('/routing', (req: Request, res: Response) => {
   const parsed = routingSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
+  }
+  // Persist the weights before flipping the strategy so the new mode reads the
+  // intended vector immediately. setCustomWeights throws on an all-zero vector.
+  if (parsed.data.weights) {
+    try {
+      setCustomWeights(parsed.data.weights);
+    } catch (err: any) {
+      res.status(400).json({ error: { message: err?.message ?? 'Invalid custom weights' } });
+      return;
+    }
   }
   setRoutingStrategy(parsed.data.strategy as RoutingStrategy);
   res.json({ strategy: getRoutingStrategy(), presets: BANDIT_PRESETS });
