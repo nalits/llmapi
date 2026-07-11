@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { extractApiToken, timingSafeStringEqual } from './proxy.js';
+import { getDb } from '../db/index.js';
+import { requireUnifiedApiKey } from '../lib/api-auth.js';
 import { buildModelListing } from '../services/model-listing.js';
 import { supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { getRoutingScores, getRoutingStrategy, setRoutingStrategy } from '../services/router.js';
@@ -266,17 +266,12 @@ function handleRpc(msg: JsonRpcRequest): unknown | undefined {
   }
 }
 
-function authenticate(req: Request, res: Response): boolean {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json(rpcError(null, -32001, 'Invalid API key. Authenticate with the unified key as a Bearer token.'));
-    return false;
-  }
+function authenticate(_req: Request, _res: Response): boolean {
+  // Auth: requireUnifiedApiKey middleware on POST /.
   return true;
 }
 
-mcpRouter.post('/', (req: Request, res: Response) => {
+mcpRouter.post('/', requireUnifiedApiKey, (req: Request, res: Response) => {
   if (!authenticate(req, res)) return;
 
   const body = req.body;

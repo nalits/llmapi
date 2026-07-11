@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { hasProvider } from '../providers/index.js';
 import { deleteUnusedCustomEndpointKey } from '../lib/custom-provider-cleanup.js';
+import { requireUserId } from '../lib/request-context.js';
 import {
   isCatalogManagedModel,
   recordCatalogModelTombstone,
@@ -30,7 +31,7 @@ const modelUpdateSchema = z.object({
   fallbackEnabled: z.boolean().optional(),
 }).strict();
 
-const MODEL_FIELD_COLUMNS: Record<keyof ModelOverridePatch | 'enabled', string> = {
+const MODEL_FIELD_COLUMNS: Record<keyof ModelOverridePatch, string> = {
   displayName: 'display_name',
   intelligenceRank: 'intelligence_rank',
   speedRank: 'speed_rank',
@@ -43,7 +44,6 @@ const MODEL_FIELD_COLUMNS: Record<keyof ModelOverridePatch | 'enabled', string> 
   contextWindow: 'context_window',
   supportsVision: 'supports_vision',
   supportsTools: 'supports_tools',
-  enabled: 'enabled',
 };
 
 type ModelRow = {
@@ -51,17 +51,21 @@ type ModelRow = {
   platform: string;
   model_id: string;
   key_id: number | null;
+  user_id: number | null;
 };
 
 function dbValue(key: keyof typeof MODEL_FIELD_COLUMNS, value: unknown): unknown {
-  if (key === 'enabled' || key === 'supportsVision' || key === 'supportsTools') return value ? 1 : 0;
+  if (key === 'supportsVision' || key === 'supportsTools') return value ? 1 : 0;
   return value;
 }
 
-function fetchModelRow(id: number): ModelRow | undefined {
+function fetchModelRow(id: number, userId: number): ModelRow | undefined {
   return getDb()
-    .prepare('SELECT id, platform, model_id, key_id FROM models WHERE id = ?')
-    .get(id) as ModelRow | undefined;
+    .prepare(`
+      SELECT id, platform, model_id, key_id, user_id FROM models
+       WHERE id = ? AND (user_id IS NULL OR user_id = ?)
+    `)
+    .get(id, userId) as ModelRow | undefined;
 }
 
 modelsRouter.delete('/custom/:id', (req: Request, res: Response) => {
@@ -72,15 +76,18 @@ modelsRouter.delete('/custom/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = db.prepare("SELECT id, key_id FROM models WHERE id = ? AND platform = 'custom'").get(id) as { id: number; key_id: number | null } | undefined;
+  const userId = requireUserId();
+  const row = db.prepare("SELECT id, key_id FROM models WHERE id = ? AND platform = 'custom' AND user_id = ?")
+    .get(id, userId) as { id: number; key_id: number | null } | undefined;
   if (!row) {
     res.status(404).json({ error: { message: `Unknown custom model ${id}` } });
     return;
   }
 
   const remove = db.transaction(() => {
-    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
-    db.prepare("DELETE FROM models WHERE id = ? AND platform = 'custom'").run(id);
+    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+    db.prepare('DELETE FROM user_model_enabled WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+    db.prepare("DELETE FROM models WHERE id = ? AND platform = 'custom' AND user_id = ?").run(id, userId);
     deleteUnusedCustomEndpointKey(db, row.key_id);
   });
   remove();
@@ -101,7 +108,8 @@ modelsRouter.patch('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = fetchModelRow(id);
+  const userId = requireUserId();
+  const row = fetchModelRow(id, userId);
   if (!row) {
     res.status(404).json({ error: { message: `Unknown model ${id}` } });
     return;
@@ -109,8 +117,9 @@ modelsRouter.patch('/:id', (req: Request, res: Response) => {
 
   const modelPatch: Partial<typeof parsed.data> = { ...parsed.data };
   delete modelPatch.fallbackEnabled;
+  delete modelPatch.enabled; // enable/disable goes to user_model_enabled
   const modelKeys = Object.keys(modelPatch) as Array<keyof typeof modelPatch>;
-  if (modelKeys.length === 0 && parsed.data.fallbackEnabled === undefined) {
+  if (modelKeys.length === 0 && parsed.data.fallbackEnabled === undefined && parsed.data.enabled === undefined) {
     res.status(400).json({ error: { message: 'No model fields provided' } });
     return;
   }
@@ -141,9 +150,16 @@ modelsRouter.patch('/:id', (req: Request, res: Response) => {
       }
     }
 
+    if (parsed.data.enabled !== undefined) {
+      db.prepare(`
+        INSERT INTO user_model_enabled (user_id, model_db_id, enabled) VALUES (?, ?, ?)
+        ON CONFLICT(user_id, model_db_id) DO UPDATE SET enabled = excluded.enabled
+      `).run(userId, id, parsed.data.enabled ? 1 : 0);
+    }
+
     if (parsed.data.fallbackEnabled !== undefined) {
-      db.prepare('UPDATE fallback_config SET enabled = ? WHERE model_db_id = ?')
-        .run(parsed.data.fallbackEnabled ? 1 : 0, id);
+      db.prepare('UPDATE fallback_config SET enabled = ? WHERE model_db_id = ? AND user_id = ?')
+        .run(parsed.data.fallbackEnabled ? 1 : 0, id, userId);
     }
   });
   applyUpdate();
@@ -159,7 +175,8 @@ modelsRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = fetchModelRow(id);
+  const userId = requireUserId();
+  const row = fetchModelRow(id, userId);
   if (!row) {
     res.status(404).json({ error: { message: `Unknown model ${id}` } });
     return;
@@ -167,11 +184,16 @@ modelsRouter.delete('/:id', (req: Request, res: Response) => {
 
   const remove = db.transaction(() => {
     if (isCatalogManagedModel(row)) {
+      // Shared catalog row stays; hide it for this user via tombstone + fallback removal.
       recordCatalogModelTombstone(db, 'chat', row.platform, row.model_id);
+      db.prepare('DELETE FROM fallback_config WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+      db.prepare('DELETE FROM user_model_enabled WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+    } else {
+      db.prepare('DELETE FROM fallback_config WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+      db.prepare('DELETE FROM user_model_enabled WHERE model_db_id = ? AND user_id = ?').run(id, userId);
+      db.prepare('DELETE FROM models WHERE id = ? AND user_id = ?').run(id, userId);
+      if (row.platform === 'custom') deleteUnusedCustomEndpointKey(db, row.key_id);
     }
-    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
-    db.prepare('DELETE FROM models WHERE id = ?').run(id);
-    if (row.platform === 'custom') deleteUnusedCustomEndpointKey(db, row.key_id);
   });
   remove();
 
@@ -181,24 +203,34 @@ modelsRouter.delete('/:id', (req: Request, res: Response) => {
 // List all models with availability info
 modelsRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
+  const userId = requireUserId();
   const models = db.prepare(`
-    SELECT m.*, fc.priority, fc.enabled as fallback_enabled,
+    SELECT m.*,
+           COALESCE(ume.enabled, m.enabled) AS effective_enabled,
+           fc.priority, fc.enabled as fallback_enabled,
            mo.overrides_json IS NOT NULL AS has_overrides,
            ak.label AS key_label
     FROM models m
-    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-    LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
-    LEFT JOIN api_keys ak ON ak.id = m.key_id
+    LEFT JOIN user_model_enabled ume ON ume.model_db_id = m.id AND ume.user_id = ?
+    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id AND fc.user_id = ?
+    LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id AND mo.user_id = ?
+    LEFT JOIN api_keys ak ON ak.id = m.key_id AND ak.user_id = ?
+    WHERE (m.user_id IS NULL OR m.user_id = ?)
+      AND NOT EXISTS (
+        SELECT 1 FROM catalog_model_tombstones t
+         WHERE t.user_id = ? AND t.kind = 'chat'
+           AND t.platform = m.platform AND t.model_id = m.model_id
+      )
     ORDER BY COALESCE(fc.priority, m.intelligence_rank) ASC
-  `).all() as any[];
+  `).all(userId, userId, userId, userId, userId, userId) as any[];
 
   // Count keys per platform
   const keyCounts = db.prepare(`
     SELECT platform, COUNT(*) as count
     FROM api_keys
-    WHERE enabled = 1
+    WHERE enabled = 1 AND user_id = ?
     GROUP BY platform
-  `).all() as { platform: string; count: number }[];
+  `).all(userId) as { platform: string; count: number }[];
 
   const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
 
@@ -216,7 +248,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     tpdLimit: m.tpd_limit,
     monthlyTokenBudget: m.monthly_token_budget,
     contextWindow: m.context_window,
-    enabled: m.enabled === 1,
+    enabled: m.effective_enabled === 1,
     supportsVision: m.supports_vision === 1,
     supportsTools: m.supports_tools === 1,
     priority: m.priority,

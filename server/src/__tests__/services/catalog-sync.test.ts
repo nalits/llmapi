@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { initDb, getDb, setSetting, getSetting } from '../../db/index.js';
 import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
-import { runMigrationsSync } from '../../db/migrate/runner.js';
 import { recordCatalogModelTombstone, upsertModelOverrides } from '../../services/model-state.js';
 
 // applyCatalog is the write path between the published catalog and the live
@@ -205,10 +204,18 @@ describe('applyCatalog', () => {
 
     recordCatalogModelTombstone(getDb(), 'chat', 'groq', 'tombstone-model');
     applyCatalog(getDb(), catalogOf(models));
-    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'tombstone-model'").get()).toBeUndefined();
+    // Shared catalog row remains; the per-user tombstone keeps it hidden.
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'tombstone-model'").get()).toBeDefined();
+    expect(getDb().prepare(`
+      SELECT 1 FROM catalog_model_tombstones
+       WHERE kind = 'chat' AND platform = 'groq' AND model_id = 'tombstone-model'
+    `).get()).toBeDefined();
 
     applyCatalog(getDb(), catalogOf(models));
-    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'tombstone-model'").get()).toBeUndefined();
+    expect(getDb().prepare(`
+      SELECT 1 FROM catalog_model_tombstones
+       WHERE kind = 'chat' AND platform = 'groq' AND model_id = 'tombstone-model'
+    `).get()).toBeDefined();
   });
 
   it('skips models for platforms this binary has no provider for', () => {
@@ -256,10 +263,8 @@ describe('reapplyCachedCatalog', () => {
   }
 
   it('restores catalog state over a re-run of the baseline migrations', () => {
-    // Catalog says: one baseline model is gone. The victim must be one that a
-    // re-runnable migration re-inserts on boot (V23's INSERT OR IGNORE rows),
-    // not a first-init-only seed row — that re-insertion is the exact drift
-    // this function exists to undo.
+    // Catalog says: one baseline model is gone. Simulate a restart that
+    // re-inserts the bundled baseline row, then boot re-apply removes it again.
     const models = existingAsCatalogModels();
     const victim = models.find((m) => m.platform === 'openrouter' && m.modelId === 'moonshotai/kimi-k2.6:free')!;
     expect(victim).toBeDefined();
@@ -271,9 +276,11 @@ describe('reapplyCachedCatalog', () => {
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
     ).toBeUndefined();
 
-    // Simulate a restart: migrations re-insert the baseline model.
-    getDb().exec('DROP TABLE migrations');
-    runMigrationsSync(getDb(), 'up');
+    // Simulate migration/boot re-inserting the baseline catalog row.
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES (?, ?, 'Resurrected', 50, 50, '', 1)
+    `).run(victim.platform, victim.modelId);
     expect(
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
     ).toBeDefined();
@@ -288,6 +295,7 @@ describe('reapplyCachedCatalog', () => {
   });
 
   it('clears the applied version when an older install has no cached document', () => {
+    getDb().prepare("DELETE FROM instance_settings WHERE key = 'catalog_applied_json'").run();
     getDb().prepare("DELETE FROM settings WHERE key = 'catalog_applied_json'").run();
     setSetting('catalog_applied_version', '2099.01.01');
     const result = reapplyCachedCatalog();

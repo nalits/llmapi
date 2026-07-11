@@ -1,5 +1,6 @@
 import type { ModelListRow } from '@freellmapi/shared/types.js';
 import { getDb } from '../db/index.js';
+import { requireUserId } from '../lib/request-context.js';
 import { isUnifyEnabled, getModelGroups } from './model-groups.js';
 
 // Shared catalog-listing logic behind both the OpenAI `GET /v1/models` and the
@@ -32,13 +33,17 @@ export interface ModelListing {
 }
 
 export function buildModelListing(): ModelListing {
+  const userId = requireUserId();
+  const enabledExpr = `COALESCE((SELECT ume.enabled FROM user_model_enabled ume WHERE ume.user_id = ${userId} AND ume.model_db_id = m.id), m.enabled)`;
   const availableExpr = `
-    (CASE WHEN m.enabled = 1 AND EXISTS (
+    (CASE WHEN ${enabledExpr} = 1 AND EXISTS (
         SELECT 1 FROM api_keys k
         WHERE k.platform = m.platform
+          AND k.user_id = ${userId}
           AND k.enabled = 1
           AND (m.key_id IS NULL OR k.id = m.key_id)
       ) THEN 1 ELSE 0 END)`;
+  const visibility = `(m.user_id IS NULL OR m.user_id = ${userId})`;
   const db = getDb();
 
   let allListed: NormalizedModel[];
@@ -49,8 +54,9 @@ export function buildModelListing(): ModelListing {
     type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; supports_tools: number };
     const rows = db.prepare(`
       SELECT m.id, m.platform, m.intelligence_rank, m.context_window, m.supports_tools,
-             m.enabled AS enabled, ${availableExpr} AS available
+             ${enabledExpr} AS enabled, ${availableExpr} AS available
       FROM models m
+      WHERE ${visibility}
     `).all() as AvailRow[];
     const byId = new Map(rows.map(r => [r.id, r]));
     allListed = getModelGroups().map(g => {
@@ -75,13 +81,14 @@ export function buildModelListing(): ModelListing {
       SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id, supports_tools
       FROM (
         SELECT m.platform, m.model_id, m.display_name, m.context_window, m.intelligence_rank, m.id, m.supports_tools,
-               m.enabled AS enabled,
+               ${enabledExpr} AS enabled,
                ${availableExpr} AS available,
                ROW_NUMBER() OVER (
                  PARTITION BY m.model_id
                  ORDER BY ${availableExpr} DESC, m.intelligence_rank ASC, m.id ASC
                ) AS rn
         FROM models m
+        WHERE ${visibility}
       )
       WHERE rn = 1
     `).all() as (ModelListRow & { intelligence_rank: number; id: number; supports_tools: number })[];

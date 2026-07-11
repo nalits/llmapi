@@ -11,6 +11,7 @@ import {
   upsertModelOverrides,
   type ModelOverridePatch,
 } from './model-state.js';
+import { requireUserId, runWithUser } from '../lib/request-context.js';
 
 const modelEntrySchema = z.union([
   z.string().min(1),
@@ -125,6 +126,7 @@ function encryptedKey(raw: string) {
 }
 
 function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
+  const userId = requireUserId();
   const platform = input.platform.trim();
   const enabled = input.enabled === false ? 0 : 1;
   const isCustom = platform === 'custom';
@@ -138,36 +140,36 @@ function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
 
   if (isCustom) {
     if (!baseUrl) throw new Error('baseUrl is required for custom keys');
-    const existing = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = ?").get(baseUrl) as { id: number } | undefined;
+    const existing = db.prepare("SELECT id FROM api_keys WHERE user_id = ? AND platform = 'custom' AND base_url = ?").get(userId, baseUrl) as { id: number } | undefined;
     if (existing) {
       db.prepare(`
         UPDATE api_keys
            SET label = ?, encrypted_key = ?, iv = ?, auth_tag = ?, enabled = ?, status = 'unknown'
-         WHERE id = ?
-      `).run(label, key.encrypted, key.iv, key.authTag, enabled, existing.id);
+         WHERE id = ? AND user_id = ?
+      `).run(label, key.encrypted, key.iv, key.authTag, enabled, existing.id, userId);
       return existing.id;
     }
     const inserted = db.prepare(`
-      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
-      VALUES ('custom', ?, ?, ?, ?, 'unknown', ?, ?)
-    `).run(label, key.encrypted, key.iv, key.authTag, enabled, baseUrl);
+      INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
+      VALUES (?, 'custom', ?, ?, ?, ?, 'unknown', ?, ?)
+    `).run(userId, label, key.encrypted, key.iv, key.authTag, enabled, baseUrl);
     return Number(inserted.lastInsertRowid);
   }
 
-  const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? AND label = ? AND base_url IS NULL LIMIT 1')
-    .get(platform, label) as { id: number } | undefined;
+  const existing = db.prepare('SELECT id FROM api_keys WHERE user_id = ? AND platform = ? AND label = ? AND base_url IS NULL LIMIT 1')
+    .get(userId, platform, label) as { id: number } | undefined;
   if (existing) {
     db.prepare(`
       UPDATE api_keys
          SET encrypted_key = ?, iv = ?, auth_tag = ?, enabled = ?, status = 'unknown'
-       WHERE id = ?
-    `).run(key.encrypted, key.iv, key.authTag, enabled, existing.id);
+       WHERE id = ? AND user_id = ?
+    `).run(key.encrypted, key.iv, key.authTag, enabled, existing.id, userId);
     return existing.id;
   }
   const inserted = db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-    VALUES (?, ?, ?, ?, ?, 'unknown', ?)
-  `).run(platform, label, key.encrypted, key.iv, key.authTag, enabled);
+    INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?)
+  `).run(userId, platform, label, key.encrypted, key.iv, key.authTag, enabled);
   return Number(inserted.lastInsertRowid);
 }
 
@@ -178,19 +180,21 @@ function normalizeModelEntry(entry: z.infer<typeof modelEntrySchema>): Normalize
 }
 
 function ensureFallbackRow(db: Db, modelDbId: number, enabled = true, updateExisting = true): void {
-  const existing = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelDbId);
+  const userId = requireUserId();
+  const existing = db.prepare('SELECT 1 FROM fallback_config WHERE user_id = ? AND model_db_id = ?').get(userId, modelDbId);
   if (existing) {
     if (updateExisting) {
-      db.prepare('UPDATE fallback_config SET enabled = ? WHERE model_db_id = ?').run(enabled ? 1 : 0, modelDbId);
+      db.prepare('UPDATE fallback_config SET enabled = ? WHERE user_id = ? AND model_db_id = ?').run(enabled ? 1 : 0, userId, modelDbId);
     }
     return;
   }
-  const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
-  db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, ?)')
-    .run(modelDbId, max.m + 1, enabled ? 1 : 0);
+  const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config WHERE user_id = ?').get(userId) as { m: number };
+  db.prepare('INSERT INTO fallback_config (user_id, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)')
+    .run(userId, modelDbId, max.m + 1, enabled ? 1 : 0);
 }
 
 function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSchema>): number {
+  const userId = requireUserId();
   const keyId = upsertApiKey(db, {
     platform: 'custom',
     key: input.apiKey,
@@ -205,8 +209,8 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, key_id)
-      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?)
+         enabled, supports_vision, supports_tools, key_id, user_id)
+      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?, ?)
       ON CONFLICT(platform, model_id)
       DO UPDATE SET
         display_name = excluded.display_name,
@@ -218,6 +222,7 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
         supports_vision = excluded.supports_vision,
         supports_tools = excluded.supports_tools,
         key_id = excluded.key_id,
+        user_id = excluded.user_id,
         enabled = 1
     `).run(
       model.modelId,
@@ -230,9 +235,14 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
       model.supportsVision ? 1 : 0,
       model.supportsTools ? 1 : 0,
       keyId,
+      userId,
     );
-    const row = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND model_id = ?").get(model.modelId) as { id: number };
+    const row = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND model_id = ? AND user_id = ?").get(model.modelId, userId) as { id: number };
     ensureFallbackRow(db, row.id, model.fallbackEnabled !== false);
+    db.prepare(`
+      INSERT INTO user_model_enabled (user_id, model_db_id, enabled) VALUES (?, ?, 1)
+      ON CONFLICT(user_id, model_db_id) DO UPDATE SET enabled = 1
+    `).run(userId, row.id);
     registered++;
   }
   return registered;
@@ -251,6 +261,7 @@ function modelPatchFromInput(input: z.infer<typeof modelSchema>): ModelOverrideP
 }
 
 function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
+  const userId = requireUserId();
   const platform = input.platform.trim();
   const modelId = input.modelId.trim();
   clearCatalogModelTombstone(db, 'chat', platform, modelId);
@@ -282,6 +293,12 @@ function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
       input.supportsTools ? 1 : 0,
     );
     const created = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { id: number };
+    if (input.enabled !== undefined) {
+      db.prepare(`
+        INSERT INTO user_model_enabled (user_id, model_db_id, enabled) VALUES (?, ?, ?)
+        ON CONFLICT(user_id, model_db_id) DO UPDATE SET enabled = excluded.enabled
+      `).run(userId, created.id, input.enabled === false ? 0 : 1);
+    }
     ensureFallbackRow(db, created.id, input.fallbackEnabled ?? input.enabled !== false);
     return;
   }
@@ -307,9 +324,12 @@ function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
     assignments.push(`${columnMap[key]} = ?`);
     values.push(key === 'supportsVision' || key === 'supportsTools' ? (patch[key] ? 1 : 0) : patch[key]);
   }
+  // Per-user enablement — do not mutate shared catalog models.enabled.
   if (input.enabled !== undefined) {
-    assignments.push('enabled = ?');
-    values.push(input.enabled ? 1 : 0);
+    db.prepare(`
+      INSERT INTO user_model_enabled (user_id, model_db_id, enabled) VALUES (?, ?, ?)
+      ON CONFLICT(user_id, model_db_id) DO UPDATE SET enabled = excluded.enabled
+    `).run(userId, existing.id, input.enabled ? 1 : 0);
   }
   if (assignments.length > 0) {
     values.push(existing.id);
@@ -322,14 +342,15 @@ function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
 }
 
 function applyFallback(db: Db, entries: z.infer<typeof fallbackEntrySchema>[]): number {
-  const update = db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?');
+  const userId = requireUserId();
+  const update = db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ? AND user_id = ?');
   let changed = 0;
   entries.forEach((entry, i) => {
     const row = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
       .get(entry.platform, entry.modelId) as { id: number } | undefined;
     if (!row) return;
     ensureFallbackRow(db, row.id, entry.enabled !== false);
-    update.run(entry.priority ?? i + 1, entry.enabled === false ? 0 : 1, row.id);
+    update.run(entry.priority ?? i + 1, entry.enabled === false ? 0 : 1, row.id, userId);
     changed++;
   });
   return changed;
@@ -342,6 +363,14 @@ export function applyDeclarativeConfig(input: unknown, source = 'inline'): Decla
   }
 
   const db = getDb();
+  // Fresh installs and unit tests may have no account yet — bootstrap one.
+  let admin = db.prepare('SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1').get() as { id: number } | undefined;
+  if (!admin) {
+    const userId = requireUserId();
+    db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(userId);
+    admin = { id: userId };
+  }
+
   const result: DeclarativeConfigResult = {
     applied: true,
     source,
@@ -352,29 +381,31 @@ export function applyDeclarativeConfig(input: unknown, source = 'inline'): Decla
     routing: false,
   };
 
-  const apply = db.transaction(() => {
-    for (const key of parsed.data.keys ?? []) {
-      upsertApiKey(db, key);
-      result.keys++;
-    }
-    for (const customProvider of parsed.data.customProviders ?? []) {
-      result.customModels += registerCustomProvider(db, customProvider);
-    }
-    for (const model of parsed.data.models ?? []) {
-      upsertModel(db, model);
-      result.models++;
-    }
-    if (parsed.data.fallback) {
-      result.fallback = applyFallback(db, parsed.data.fallback);
-    }
-    if (parsed.data.routing) {
-      if (parsed.data.routing.weights) setCustomWeights(parsed.data.routing.weights);
-      setRoutingStrategy(parsed.data.routing.strategy);
-      result.routing = true;
-    }
+  return runWithUser(admin.id, () => {
+    const apply = db.transaction(() => {
+      for (const key of parsed.data.keys ?? []) {
+        upsertApiKey(db, key);
+        result.keys++;
+      }
+      for (const customProvider of parsed.data.customProviders ?? []) {
+        result.customModels += registerCustomProvider(db, customProvider);
+      }
+      for (const model of parsed.data.models ?? []) {
+        upsertModel(db, model);
+        result.models++;
+      }
+      if (parsed.data.fallback) {
+        result.fallback = applyFallback(db, parsed.data.fallback);
+      }
+      if (parsed.data.routing) {
+        if (parsed.data.routing.weights) setCustomWeights(parsed.data.routing.weights);
+        setRoutingStrategy(parsed.data.routing.strategy);
+        result.routing = true;
+      }
+    });
+    apply();
+    return result;
   });
-  apply();
-  return result;
 }
 
 export function applyDeclarativeConfigFromEnv(): DeclarativeConfigResult {

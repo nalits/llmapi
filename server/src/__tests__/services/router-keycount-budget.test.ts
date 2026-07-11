@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
+import { requireUserId } from '../../lib/request-context.js';
 import { encrypt } from '../../lib/crypto.js';
 import { getRoutingScores, refreshStatsCache } from '../../services/router.js';
 
@@ -15,16 +16,15 @@ describe('routing headroom scales the monthly budget by usable key count (#456)'
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
     const db = getDb();
+    const userId = requireUserId();
     const m = db.prepare("SELECT id, model_id FROM models WHERE platform = 'groq' ORDER BY id LIMIT 1").get() as { id: number; model_id: string };
     modelDbId = m.id;
     modelId = m.model_id;
-    // A known, parseable per-key budget so headroom math is deterministic.
     db.prepare("UPDATE models SET monthly_token_budget = '~1M' WHERE id = ?").run(modelDbId);
-    // ~950k tokens used this month (pooled across keys): 95% of a single key's 1M.
     db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, created_at)
-      VALUES (?, ?, NULL, 'success', 500000, 450000, 10, NULL, 'chat', datetime('now'))
-    `).run('groq', modelId);
+      INSERT INTO requests (user_id, platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, created_at)
+      VALUES (?, ?, ?, NULL, 'success', 500000, 450000, 10, NULL, 'chat', datetime('now'))
+    `).run(userId, 'groq', modelId);
   });
 
   beforeEach(() => {
@@ -41,12 +41,13 @@ describe('routing headroom scales the monthly budget by usable key count (#456)'
 
   function addGroqKeys(n: number) {
     const db = getDb();
+    const userId = requireUserId();
     for (let i = 0; i < n; i++) {
       const { encrypted, iv, authTag } = encrypt(`groq-${i}`);
       db.prepare(`
-        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-        VALUES ('groq', ?, ?, ?, ?, 'healthy', 1)
-      `).run(`k${i}`, encrypted, iv, authTag);
+        INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES (?, 'groq', ?, ?, ?, ?, 'healthy', 1)
+      `).run(userId, `k${i}`, encrypted, iv, authTag);
     }
   }
 
@@ -65,9 +66,10 @@ describe('routing headroom scales the monthly budget by usable key count (#456)'
     addGroqKeys(1); // one healthy key
     const db = getDb();
     // An invalid and a disabled key add NO pooled capacity.
+    const userId = requireUserId();
     const bad = encrypt('bad'); const off = encrypt('off');
-    db.prepare("INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES ('groq','bad',?,?,?,'invalid',1)").run(bad.encrypted, bad.iv, bad.authTag);
-    db.prepare("INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES ('groq','off',?,?,?,'healthy',0)").run(off.encrypted, off.iv, off.authTag);
+    db.prepare("INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES (?,'groq','bad',?,?,?,'invalid',1)").run(userId, bad.encrypted, bad.iv, bad.authTag);
+    db.prepare("INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES (?,'groq','off',?,?,?,'healthy',0)").run(userId, off.encrypted, off.iv, off.authTag);
     // Still effectively single-key → still damped.
     expect(headroomFor()).toBeLessThan(1);
   });

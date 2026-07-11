@@ -393,22 +393,28 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
   it('auto-panel ordering follows the picked routing strategy, deterministically', () => {
     const original = getRoutingStrategy();
     try {
-      // Priority mode: ordering is the manual chain order, and stable.
+      const db = getDb();
+      db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
+
+      // Push the smartest catalog model to the end of both the fallback chain
+      // and every profile so priority order diverges from intelligence rank.
+      const topSmart = db.prepare(
+        'SELECT id FROM models ORDER BY intelligence_rank ASC, id ASC LIMIT 1',
+      ).get() as { id: number };
+      db.prepare('UPDATE fallback_config SET priority = 99999 WHERE model_db_id = ?').run(topSmart.id);
+      db.prepare('UPDATE profile_models SET priority = 99999 WHERE model_db_id = ?').run(topSmart.id);
+
       setRoutingStrategy('priority');
       const p1 = getOrderedFusionChain().map(c => c.modelId);
       const p2 = getOrderedFusionChain().map(c => c.modelId);
       expect(p1.length).toBeGreaterThan(0);
       expect(p2).toEqual(p1);
 
-      // Bandit mode: previously Thompson-sampled (random per call); now the
-      // deterministic expected-score ranking, so two calls must be identical.
       setRoutingStrategy('smartest');
       const s1 = getOrderedFusionChain().map(c => c.modelId);
       const s2 = getOrderedFusionChain().map(c => c.modelId);
       expect(s2).toEqual(s1);
 
-      // The strategy actually drives the ordering: 'smartest' (intelligence)
-      // and 'priority' (manual chain order) rank the seeded catalog differently.
       expect(s1).not.toEqual(p1);
     } finally {
       setRoutingStrategy(original);

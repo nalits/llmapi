@@ -10,6 +10,7 @@ import { useI18n } from '@/i18n'
 import type { HealthData } from '@/components/keys/shared'
 import { QuotaSignalsSection } from '@/components/keys/quota-signals-section'
 import { UnifiedKeySection } from '@/components/keys/unified-key-section'
+import { InviteCodeSection } from '@/components/keys/invite-code-section'
 import { ProxySettingsSection } from '@/components/keys/proxy-settings-section'
 import { AnthropicSection } from '@/components/keys/anthropic-section'
 import { ProviderList } from '@/components/keys/provider-list'
@@ -90,6 +91,7 @@ export default function KeysPage() {
         {tab === 'apiKey' && (
           <>
             <UnifiedKeySection />
+            <InviteCodeSection />
             <ProxySettingsSection />
           </>
         )}

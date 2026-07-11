@@ -13,8 +13,10 @@ const PASSWORD_MIN = 8
 
 interface AuthStatus {
   needsSetup: boolean
+  needsInvite?: boolean
   authenticated: boolean
   email: string | null
+  isAdmin?: boolean
 }
 
 function Centered({ children }: { children: ReactNode }) {
@@ -25,23 +27,29 @@ function Centered({ children }: { children: ReactNode }) {
   )
 }
 
-function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () => void }) {
+type AuthMode = 'setup' | 'login' | 'register'
+
+function AuthForm({ mode, onAuthed, onSwitchMode }: {
+  mode: AuthMode
+  onAuthed: () => void
+  onSwitchMode?: (mode: 'login' | 'register') => void
+}) {
   const { t } = useI18n()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [setupCode, setSetupCode] = useState('')
-  // Revealed only after the server asks for it (remote first-run setup). A
-  // browser on the same machine as the server never sees this field.
-  const [codeRequired, setCodeRequired] = useState(false)
+  // Revealed only after the server asks for it (remote first-run setup).
+  // Register always requires the setup code.
+  const [codeRequired, setCodeRequired] = useState(mode === 'register')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [attempted, setAttempted] = useState(false)
 
   const isSetup = mode === 'setup'
+  const isRegister = mode === 'register'
+  const needsNewPassword = isSetup || isRegister
+  const showSetupCode = isRegister || (isSetup && codeRequired)
 
-  // Inline field feedback; the server stays authoritative. Only the setup form
-  // enforces the password minimum client-side (an existing password of any
-  // length must still be able to log in).
   const emailError = !email.trim()
     ? t('validation.required')
     : !isEmail(email)
@@ -49,13 +57,16 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
       : null
   const passwordError = !password
     ? t('validation.required')
-    : isSetup && password.length < PASSWORD_MIN
+    : needsNewPassword && password.length < PASSWORD_MIN
       ? t('validation.passwordMin', { min: PASSWORD_MIN })
       : null
+  const setupCodeError = showSetupCode && !setupCode.trim()
+    ? t('validation.required')
+    : null
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
-    if (emailError || passwordError) {
+    if (emailError || passwordError || setupCodeError) {
       setAttempted(true)
       return
     }
@@ -63,18 +74,19 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
     setError('')
     try {
       const payload: Record<string, string> = { email, password }
-      // Only the setup flow carries a code, and only once the server has asked
-      // for it. The server ignores it for local (loopback) setup.
-      if (isSetup && setupCode) payload.setupCode = setupCode.trim()
-      const res = await apiFetch<{ token: string }>(isSetup ? '/api/auth/setup' : '/api/auth/login', {
+      if (showSetupCode && setupCode) payload.setupCode = setupCode.trim()
+      const path = isSetup
+        ? '/api/auth/setup'
+        : isRegister
+          ? '/api/auth/register'
+          : '/api/auth/login'
+      const res = await apiFetch<{ token: string }>(path, {
         method: 'POST',
         body: JSON.stringify(payload),
       })
       setToken(res.token)
       onAuthed()
     } catch (err) {
-      // The server gates remote first-run setup behind a one-time code; reveal
-      // the field so the operator can paste the code from the server logs.
       if (isSetup && (err as ApiError).code === 'setup_code_required') {
         setCodeRequired(true)
       }
@@ -84,6 +96,20 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
     }
   }
 
+  const title = isSetup
+    ? t('auth.createYourAccount')
+    : isRegister
+      ? t('auth.createAccountWithInvite')
+      : t('auth.signIn')
+  const description = isSetup
+    ? t('auth.setupDescription')
+    : isRegister
+      ? t('auth.registerDescription')
+      : t('auth.loginDescription')
+  const submitLabel = busy
+    ? (needsNewPassword ? t('auth.creating') : t('auth.signingIn'))
+    : (needsNewPassword ? t('auth.createAccount') : t('auth.signIn'))
+
   return (
     <Centered>
       <div className="mb-6 flex items-center gap-2">
@@ -91,12 +117,8 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
         <span className="font-semibold tracking-tight text-sm">FreeLLMAPI</span>
       </div>
       <div className="rounded-3xl border bg-card p-6">
-        <h1 className="text-base font-medium">{isSetup ? t('auth.createYourAccount') : t('auth.signIn')}</h1>
-        <p className="text-xs text-muted-foreground mt-1 mb-4">
-          {isSetup
-            ? t('auth.setupDescription')
-            : t('auth.loginDescription')}
-        </p>
+        <h1 className="text-base font-medium">{title}</h1>
+        <p className="text-xs text-muted-foreground mt-1 mb-4">{description}</p>
         <form onSubmit={submit} className="space-y-3" noValidate>
           <div className="space-y-1.5">
             <Label className="text-xs" htmlFor="auth-email">{t('auth.email')}</Label>
@@ -116,15 +138,15 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
             <Input
               id="auth-password"
               type="password"
-              autoComplete={isSetup ? 'new-password' : 'current-password'}
+              autoComplete={needsNewPassword ? 'new-password' : 'current-password'}
               value={password}
               onChange={e => setPassword(e.target.value)}
-              placeholder={isSetup ? t('auth.passwordPlaceholderSetup') : t('auth.passwordPlaceholderLogin')}
+              placeholder={needsNewPassword ? t('auth.passwordPlaceholderSetup') : t('auth.passwordPlaceholderLogin')}
               aria-invalid={attempted && !!passwordError}
             />
             {attempted && <FieldError error={passwordError} />}
           </div>
-          {isSetup && codeRequired && (
+          {showSetupCode && (
             <div className="space-y-1.5">
               <Label className="text-xs" htmlFor="auth-setup-code">{t('auth.setupCode')}</Label>
               <Input
@@ -134,15 +156,38 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
                 value={setupCode}
                 onChange={e => setSetupCode(e.target.value)}
                 placeholder={t('auth.setupCodePlaceholder')}
+                aria-invalid={attempted && !!setupCodeError}
               />
-              <p className="text-xs text-muted-foreground">{t('auth.setupCodeHint')}</p>
+              {attempted && <FieldError error={setupCodeError} />}
+              <p className="text-xs text-muted-foreground">
+                {isRegister ? t('auth.registerSetupCodeHint') : t('auth.setupCodeHint')}
+              </p>
             </div>
           )}
           {error && <p className="text-destructive text-xs">{error}</p>}
           <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? (isSetup ? t('auth.creating') : t('auth.signingIn')) : isSetup ? t('auth.createAccount') : t('auth.signIn')}
+            {submitLabel}
           </Button>
         </form>
+        {!isSetup && onSwitchMode && !(typeof window !== 'undefined' && (window as any).__FREEAPI_DESKTOP__) && (
+          <p className="text-xs text-muted-foreground mt-4 text-center">
+            {isRegister ? (
+              <>
+                {t('auth.haveAccount')}{' '}
+                <button type="button" className="underline underline-offset-2" onClick={() => onSwitchMode('login')}>
+                  {t('auth.signIn')}
+                </button>
+              </>
+            ) : (
+              <>
+                {t('auth.needAccount')}{' '}
+                <button type="button" className="underline underline-offset-2" onClick={() => onSwitchMode('register')}>
+                  {t('auth.createAccount')}
+                </button>
+              </>
+            )}
+          </p>
+        )}
       </div>
     </Centered>
   )
@@ -151,6 +196,7 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
 export function AuthGate({ children }: { children: ReactNode }) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
   const { data, isLoading, isError, refetch } = useQuery<AuthStatus>({
     queryKey: ['auth-status'],
     queryFn: () => apiFetch('/api/auth/status'),
@@ -164,7 +210,6 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }, [refetch])
 
   function onAuthed() {
-    // New session: drop any cached (unauthenticated) data and re-check status.
     queryClient.invalidateQueries()
     refetch()
   }
@@ -181,7 +226,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
 
   if (data.needsSetup) return <AuthForm mode="setup" onAuthed={onAuthed} />
-  if (!data.authenticated) return <AuthForm mode="login" onAuthed={onAuthed} />
+  if (!data.authenticated) {
+    return (
+      <AuthForm
+        key={authMode}
+        mode={authMode}
+        onAuthed={onAuthed}
+        onSwitchMode={setAuthMode}
+      />
+    )
+  }
 
   return <>{children}</>
 }

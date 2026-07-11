@@ -134,7 +134,7 @@ The scope is deliberately narrow. If a feature isn't on this list and isn't belo
 
 - **Moderation** (`/v1/moderations`)
 - **`n > 1`** (multiple completions per request)
-- **Per-user billing / multi-tenant auth** — single-user by design
+- **Per-user billing / seats** — accounts are isolated, but there is no billing layer
 
 PRs that add any of these are very welcome. See [Contributing](#contributing).
 
@@ -188,7 +188,7 @@ Your fresh install ships with the free catalog snapshot (82 models today) and ke
 > HOST_BIND=0.0.0.0 docker compose up -d
 > ```
 >
-> Only do this on a trusted network: the proxy is single-user and guarded only by the unified API key.
+> Only do this on a trusted network: each account has its own unified API key and provider keys, but the instance is still meant for invited operators — don't expose it to the open internet.
 
 ### Local development
 
@@ -288,7 +288,7 @@ docker compose up -d
 docker compose logs -f freellmapi
 ```
 
-By default the container's port is bound to `127.0.0.1` (localhost only). To reach the dashboard/API from another machine on your network, publish it on all interfaces with `HOST_BIND=0.0.0.0 docker compose up -d` — only on a trusted LAN, since the proxy is single-user.
+By default the container's port is bound to `127.0.0.1` (localhost only). To reach the dashboard/API from another machine on your network, publish it on all interfaces with `HOST_BIND=0.0.0.0 docker compose up -d` — only on a trusted LAN.
 
 SQLite data is stored in the `freellmapi-data` volume at `/app/server/data`.
 Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading, because
@@ -430,9 +430,13 @@ claude mcp add --transport http freellmapi http://localhost:3001/mcp \
 Any MCP client that speaks Streamable HTTP works the same way: point it at `/mcp` with the
 unified key as a Bearer token.
 
-FreeLLMAPI is local-first and single-user by design. Your provider keys stay in
-your SQLite database, encrypted at rest, and requests go from your machine to the
-upstream providers you enabled.
+FreeLLMAPI is local-first. Accounts are setup-code-gated and fully isolated: each user
+gets their own unified API key, provider keys, profiles, settings, and analytics.
+Your provider keys stay in your SQLite database, encrypted at rest, and requests go
+from the server to the upstream providers you enabled. Every new account needs the
+**setup code** printed in the server logs at startup (admins can also view or rotate
+it under **Keys → Setup code**). Each person should still use their own provider
+credentials (see [Terms of Service review](#terms-of-service-review)).
 
 ## Premium (live catalog)
 
@@ -780,7 +784,7 @@ Stacking free tiers has real trade-offs. Be honest with yourself about them:
 - **Latency is highly variable.** Cerebras and Groq are extremely fast; others are not. You get whichever one is available.
 - **Free tiers can change without notice.** Providers regularly tighten, loosen, or remove free tiers. When that happens you'll see 429s or auth errors until the catalog update reaches you — live-feed installs get those fixes within days, free installs on the 30-day trail. Re-seed scripts live in `server/src/scripts/`.
 - **No SLA, by definition.** If you need reliability, use a paid provider with a contract.
-- **Local-first.** There's no multi-tenant auth. Run this for yourself; don't expose it to the internet.
+- **Local-first, setup-code-gated.** Multi-user accounts are supported with full data isolation, but every signup requires the setup code from the server logs (or Keys → Setup code for admins). Don't expose the instance to the open internet.
 
 ## Contributing
 
@@ -895,7 +899,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full migration CLI and workflow
 
 ## Terms of Service review
 
-A self-hosted, single-user, personal-use setup was re-reviewed against each provider's ToS (May 2026). Summary:
+A self-hosted, invite-gated, personal-use setup was re-reviewed against each provider's ToS (May 2026). Summary:
 
 | Provider | Verdict | Notes |
 |---|---|---|
@@ -914,7 +918,7 @@ A self-hosted, single-user, personal-use setup was re-reviewed against each prov
 | OVH AI Endpoints | ✅ Likely OK | New row (June 2026) — anonymous access is officially documented (2 req/min per IP per model). OVH reserves the right to introduce token/consumption caps. |
 | AI Horde | ✅ Likely OK | New row (June 2026) — a free, community-powered commons run by the Haidra non-profit; anonymous use is officially supported (key `0000000000`, lowest queue priority). No anti-proxy / anti-resale clause. The OpenAI proxy is a pilot and may be restricted by usage. *(Integration #345.)* |
 
-Rules of thumb that keep most providers happy: **one account per provider**, **no reselling**, **no sharing your endpoint with other humans**, **don't hammer a free tier as a paid production backend**. This is informational, not legal advice — read each provider's ToS and make your own call.
+Rules of thumb that keep most providers happy: **one account per provider per human**, **no reselling**, **no sharing your unified endpoint key with other humans** (each person should create their own FreeLLMAPI account and bring their own provider keys), **don't hammer a free tier as a paid production backend**. This is informational, not legal advice — read each provider's ToS and make your own call.
 
 Removed since the April 2026 review: Hugging Face, Moonshot, and MiniMax direct integrations were dropped from the catalog (HF — tool-call format issues; Moonshot — moved to paid only; MiniMax — superseded by the OpenRouter `minimax/minimax-m2.5:free` route).
 

@@ -8,13 +8,16 @@ import {
   createSession,
   validateSession,
   deleteSession,
+  inviteCodeMatches,
+  ensureEnrollmentInviteCode,
+  logEnrollmentSetupCode,
 } from '../services/auth.js';
-import { setupCodeMatches, clearSetupCode } from '../lib/setup-code.js';
+import { setupCodeMatches, clearSetupCode, getSetupCode } from '../lib/setup-code.js';
 
 export const authRouter = Router();
 
-// Dashboard auth (#35). These routes are mounted BEFORE requireAuth, so
-// /status, /setup and /login are reachable without a session (bootstrap);
+// Dashboard auth. These routes are mounted BEFORE requireAuth, so
+// /status, /setup, /register and /login are reachable without a session;
 // /logout and /me validate the token themselves.
 
 const credentialsSchema = z.object({
@@ -22,9 +25,16 @@ const credentialsSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
+// Prefer setupCode (same secret as first-run / server logs). inviteCode kept as alias.
+const registerSchema = credentialsSchema.extend({
+  setupCode: z.string().min(1).optional(),
+  inviteCode: z.string().min(1).optional(),
+}).refine(d => !!(d.setupCode?.trim() || d.inviteCode?.trim()), {
+  message: 'Setup code is required',
+  path: ['setupCode'],
+});
+
 // ── Brute-force throttle ──────────────────────────────────────────────────
-// Simple in-memory per-email limiter. A local single-user tool doesn't need a
-// distributed store; this just blunts online password guessing.
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const attempts = new Map<string, { count: number; lockedUntil: number }>();
@@ -52,41 +62,33 @@ function bearer(req: Request): string | undefined {
     ?? (req.headers['x-dashboard-token'] as string | undefined);
 }
 
-// Is the caller connecting from the local machine? We check the actual socket
-// peer address, NOT req.ip or X-Forwarded-For: those are attacker-controlled
-// behind a proxy (and trust proxy is off by default anyway), so trusting them
-// here would let a remote caller pretend to be local and skip the setup code.
 function isLoopbackRemote(req: Request): boolean {
   let addr = req.socket.remoteAddress ?? '';
-  // Node reports IPv4 loopback over a dual-stack socket as "::ffff:127.0.0.1".
   if (addr.startsWith('::ffff:')) addr = addr.slice(7);
   if (addr === '::1') return true;
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(addr);
 }
 
-// Has the dashboard been set up yet, and is this caller authenticated?
 authRouter.get('/status', (req: Request, res: Response) => {
   const session = validateSession(bearer(req));
+  const count = userCount();
   res.json({
-    needsSetup: userCount() === 0,
+    needsSetup: count === 0,
+    needsInvite: count > 0 && !session,
     authenticated: !!session,
     email: session?.email ?? null,
+    isAdmin: session?.isAdmin ?? false,
   });
 });
 
-// First-run account creation. Only allowed while there are zero users, so it
-// can't be used to add accounts once the dashboard is claimed.
+// First-run account creation. Only allowed while there are zero users.
 authRouter.post('/setup', (req: Request, res: Response) => {
   if (userCount() > 0) {
     clearSetupCode();
-    res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
+    res.status(409).json({ error: { message: 'Setup already completed. Use login or register instead.', type: 'setup_complete' } });
     return;
   }
 
-  // Local/desktop first-run stays frictionless: a browser on this machine can
-  // claim the dashboard without any code. A remote caller must present the
-  // one-time setup code logged at boot, so an exposed fresh install can't be
-  // claimed by a stranger who finds it first.
   if (!isLoopbackRemote(req) && !setupCodeMatches((req.body ?? {}).setupCode)) {
     res.status(403).json({
       error: {
@@ -103,10 +105,65 @@ authRouter.post('/setup', (req: Request, res: Response) => {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
-  const user = createUser(parsed.data.email, parsed.data.password);
-  clearSetupCode(); // one-time: the dashboard is now claimed
-  const token = createSession(user.userId);
-  res.status(201).json({ token, email: user.email });
+
+  try {
+    // Keep the first-run setup code as the ongoing enrollment secret so the
+    // same value from the server logs works for every later signup.
+    ensureEnrollmentInviteCode(getSetupCode());
+    clearSetupCode();
+    const user = createUser(parsed.data.email, parsed.data.password, { isAdmin: true });
+    logEnrollmentSetupCode();
+    const token = createSession(user.userId);
+    res.status(201).json({ token, email: user.email, isAdmin: user.isAdmin });
+  } catch (err: any) {
+    if (err?.code === 'email_taken') {
+      res.status(409).json({ error: { message: err.message, type: 'email_taken' } });
+      return;
+    }
+    throw err;
+  }
+});
+
+// Setup-code-gated enrollment for additional users (same secret as first-run).
+authRouter.post('/register', (req: Request, res: Response) => {
+  if (userCount() === 0) {
+    res.status(409).json({ error: { message: 'Server has no admin yet. Use setup instead.', type: 'setup_required' } });
+    return;
+  }
+
+  const parsed = registerSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  const code = (parsed.data.setupCode ?? parsed.data.inviteCode ?? '').trim();
+  if (!inviteCodeMatches(code)) {
+    res.status(403).json({
+      error: {
+        message: 'Invalid setup code. Check the server logs, or ask an admin (Keys → Setup code).',
+        type: 'invalid_setup_code',
+      },
+    });
+    return;
+  }
+
+  if (isLockedOut(parsed.data.email)) {
+    res.status(429).json({ error: { message: 'Too many failed attempts. Try again later.', type: 'rate_limit_error' } });
+    return;
+  }
+
+  try {
+    const user = createUser(parsed.data.email, parsed.data.password, { isAdmin: false });
+    const token = createSession(user.userId);
+    res.status(201).json({ token, email: user.email, isAdmin: false });
+  } catch (err: any) {
+    if (err?.code === 'email_taken') {
+      res.status(409).json({ error: { message: err.message, type: 'email_taken' } });
+      return;
+    }
+    throw err;
+  }
 });
 
 authRouter.post('/login', (req: Request, res: Response) => {
@@ -125,14 +182,13 @@ authRouter.post('/login', (req: Request, res: Response) => {
   const user = verifyCredentials(email, password);
   if (!user) {
     recordFailure(email);
-    // Same message whether the email exists or not — don't leak which.
     res.status(401).json({ error: { message: 'Invalid email or password', type: 'authentication_error' } });
     return;
   }
 
   clearFailures(email);
   const token = createSession(user.userId);
-  res.json({ token, email: user.email });
+  res.json({ token, email: user.email, isAdmin: user.isAdmin });
 });
 
 authRouter.post('/logout', (req: Request, res: Response) => {
@@ -146,5 +202,5 @@ authRouter.get('/me', (req: Request, res: Response) => {
     res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });
     return;
   }
-  res.json({ email: session.email });
+  res.json({ email: session.email, isAdmin: session.isAdmin, userId: session.userId });
 });

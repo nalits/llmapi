@@ -105,7 +105,12 @@ describe('Tools-aware routing', () => {
 
     const gemma = db.prepare("SELECT id FROM models WHERE platform = 'google' AND LOWER(model_id) LIKE '%gemma%' AND enabled = 1").get() as { id: number } | undefined;
     expect(gemma).toBeDefined();
+    // Bump every chain entry, then pin gemma first on both fallback + profiles
+    // (active profile may still be set depending on settings layout).
+    db.prepare('UPDATE fallback_config SET priority = priority + 1').run();
     db.prepare('UPDATE fallback_config SET priority = 0, enabled = 1 WHERE model_db_id = ?').run(gemma!.id);
+    db.prepare('UPDATE profile_models SET priority = priority + 1').run();
+    db.prepare('UPDATE profile_models SET priority = 0, enabled = 1 WHERE model_db_id = ?').run(gemma!.id);
 
     // Plain request takes the chain head: gemma.
     const plain = routeRequest(1000);

@@ -68,8 +68,10 @@ describe('OpenAPI docs routes', () => {
   // Guard against re-introducing the stale fork endpoint: the fork's spec
   // documented GET /v1/usage, which has never existed on this router.
   it('does not expose a phantom /v1/usage endpoint', async () => {
+    // Unauthenticated unknown /v1 paths are rejected by unified-key auth (401)
+    // before Express can 404 — either way the endpoint is not served.
     const { status } = await request(app, 'GET', '/v1/usage');
-    expect(status).toBe(404);
+    expect([401, 404]).toContain(status);
   });
 
   it('has internally consistent $ref pointers', () => {

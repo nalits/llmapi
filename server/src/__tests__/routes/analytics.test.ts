@@ -62,26 +62,27 @@ function upsertAggregate(
   const hour = createdAt.slice(0, 13) + ':00:00';
   const isSuccess = status === 'success' ? 1 : 0;
   const isError = status === 'error' ? 1 : 0;
+  const userId = (db.prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as { id: number }).id;
   db.prepare(`
-    INSERT INTO request_hourly (hour, total_requests, success_count, error_count, input_tokens, output_tokens)
-    VALUES (?, 1, ?, ?, ?, ?)
-    ON CONFLICT(hour) DO UPDATE SET
+    INSERT INTO request_hourly (user_id, hour, total_requests, success_count, error_count, input_tokens, output_tokens)
+    VALUES (?, ?, 1, ?, ?, ?, ?)
+    ON CONFLICT(user_id, hour) DO UPDATE SET
       total_requests = total_requests + 1,
       success_count  = success_count + ?,
       error_count    = error_count + ?,
       input_tokens   = input_tokens + ?,
       output_tokens  = output_tokens + ?
-  `).run(hour, isSuccess, isError, inputTokens, outputTokens, isSuccess, isError, inputTokens, outputTokens);
+  `).run(userId, hour, isSuccess, isError, inputTokens, outputTokens, isSuccess, isError, inputTokens, outputTokens);
 
   const incr = db.prepare(`
-    INSERT INTO settings (key, value) VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)
+    INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)
+    ON CONFLICT(user_id, key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)
   `);
-  incr.run('total_requests', '1', 1);
-  incr.run('total_input_tokens', String(inputTokens), inputTokens);
-  incr.run('total_output_tokens', String(outputTokens), outputTokens);
-  db.prepare(`INSERT INTO settings (key, value) VALUES ('first_request_at', ?)
-    ON CONFLICT(key) DO NOTHING`).run(createdAt);
+  incr.run(userId, 'total_requests', '1', 1);
+  incr.run(userId, 'total_input_tokens', String(inputTokens), inputTokens);
+  incr.run(userId, 'total_output_tokens', String(outputTokens), outputTokens);
+  db.prepare(`INSERT INTO settings (user_id, key, value) VALUES (?, 'first_request_at', ?)
+    ON CONFLICT(user_id, key) DO NOTHING`).run(userId, createdAt);
 }
 
 describe('Analytics API', () => {

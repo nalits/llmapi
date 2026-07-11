@@ -47,13 +47,20 @@ describe('First-run setup code gate (FIX 1)', () => {
     const db = getDb();
     db.prepare('DELETE FROM sessions').run();
     db.prepare('DELETE FROM users').run();
+    db.prepare("DELETE FROM instance_settings WHERE key = 'enrollment_invite_code'").run();
     generateSetupCode();
   });
 
   it('allows setup from IPv4 loopback without a code', async () => {
+    const bootCode = getSetupCode();
     const { status, body } = await postSetup(appWithRemote('127.0.0.1'), CREDS);
     expect(status).toBe(201);
     expect(typeof body.token).toBe('string');
+    // First-run code is kept as the enrollment setup code for later signups.
+    const stored = (getDb().prepare(
+      "SELECT value FROM instance_settings WHERE key = 'enrollment_invite_code'"
+    ).get() as { value: string } | undefined)?.value;
+    expect(stored).toBe(bootCode);
   });
 
   it('allows setup from IPv6 loopback without a code', async () => {

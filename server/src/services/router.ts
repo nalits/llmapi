@@ -10,9 +10,16 @@ import {
 import { parseBudget } from '../lib/budget.js';
 import { platformDropsResponseFormat } from '../lib/sampling-params.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from './model-groups.js';
+import { requireUserId } from '../lib/request-context.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { Db } from '../db/types.js';
+
+/** SQL fragment: model visible to user and enabled for them (catalog shared or owned). Pass userId twice. */
+const MODEL_VISIBLE_ENABLED = `
+  (m.user_id IS NULL OR m.user_id = ?)
+  AND COALESCE((SELECT ume.enabled FROM user_model_enabled ume WHERE ume.user_id = ? AND ume.model_db_id = m.id), m.enabled) = 1
+`;
 
 class RouteError extends Error {
   status: number;
@@ -317,17 +324,23 @@ interface ModelStats {
   monthlyUsedTokens: number; // calendar-month usage, for the headroom guardrail
 }
 
-let statsCache: Map<string, ModelStats> | null = null;
-let statsCacheTime = 0;
+let statsCacheByUser: Map<number, { cache: Map<string, ModelStats>; time: number }> = new Map();
+
+/** Drop cached reliability/speed stats (tests re-init the DB between cases). */
+export function clearStatsCache(): void {
+  statsCacheByUser = new Map();
+}
 
 function decayWeight(ageDays: number): number {
   return Math.pow(0.5, Math.max(0, ageDays) / HALF_LIFE_DAYS);
 }
 
 export function refreshStatsCache(db: Db, force = false): void {
-  if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
+  const userId = requireUserId();
+  const existing = statsCacheByUser.get(userId);
+  if (!force && existing && Date.now() - existing.time < CACHE_TTL_MS) return;
 
-  const since = new Date(Date.now() - WINDOW_MS).toISOString();
+  const sinceExpr = `datetime('now', '-7 days')`;
   const buckets = db.prepare(`
     SELECT platform, model_id,
       CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
@@ -338,9 +351,9 @@ export function refreshStatsCache(db: Db, force = false): void {
       SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN ttfb_ms ELSE 0 END) AS succ_ttfb_sum,
       SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt
     FROM requests
-    WHERE created_at >= ?
+    WHERE created_at >= ${sinceExpr} AND user_id = ?
     GROUP BY platform, model_id, age_days
-  `).all(since) as Array<{
+  `).all(userId) as Array<{
     platform: string; model_id: string; age_days: number; total: number; successes: number;
     succ_out: number; succ_lat: number; succ_ttfb_sum: number; succ_ttfb_cnt: number;
   }>;
@@ -368,8 +381,9 @@ export function refreshStatsCache(db: Db, force = false): void {
     FROM requests
     WHERE created_at >= datetime('now', 'start of month')
       AND request_type = 'chat'
+      AND user_id = ?
     GROUP BY platform, model_id
-  `).all() as Array<{ platform: string; model_id: string; used: number }>;
+  `).all(userId) as Array<{ platform: string; model_id: string; used: number }>;
   const usageMap = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
 
   const next = new Map<string, ModelStats>();
@@ -389,8 +403,15 @@ export function refreshStatsCache(db: Db, force = false): void {
     }
   }
 
-  statsCache = next;
-  statsCacheTime = Date.now();
+  statsCacheByUser.set(userId, { cache: next, time: Date.now() });
+}
+
+function getStatsCache(): Map<string, ModelStats> | null {
+  // Match refreshStatsCache: unit tests / scripts often have no ALS bind but a
+  // single operator user via requireUserId(). getCurrentUserId() alone would
+  // miss the cache and score every model as "no history" (reliability 0.5).
+  const userId = requireUserId();
+  return statsCacheByUser.get(userId)?.cache ?? null;
 }
 
 // Composite intelligence: size_label is the cross-provider capability tier
@@ -419,9 +440,10 @@ interface ScoredEntry {
 // must scale to match or the headroom guardrail damps a multi-key model to the
 // floor after just one account's worth of tokens.
 function usableKeyCountsByPlatform(db: Db): Map<string, number> {
+  const userId = requireUserId();
   const rows = db.prepare(
-    "SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform"
-  ).all() as { platform: string; count: number }[];
+    "SELECT platform, COUNT(*) AS count FROM api_keys WHERE user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform"
+  ).all(userId) as { platform: string; count: number }[];
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
@@ -433,7 +455,7 @@ function scoreChainEntry(
   sampled: boolean,
   keyCounts: Map<string, number>,
 ): ScoredEntry {
-  const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+  const stats = getStatsCache()?.get(`${entry.platform}:${entry.model_id}`);
   const successes = stats?.successes ?? 0;
   const failures = stats?.failures ?? 0;
 
@@ -526,9 +548,10 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
 };
 
 function getActiveChain(db: Db): ChainRow[] {
-  const activeProfileSetting = db.prepare("SELECT value FROM settings WHERE key = 'active_profile_id'").get() as { value: string } | undefined;
+  const userId = requireUserId();
+  const activeProfileSetting = getSetting('active_profile_id');
   if (activeProfileSetting) {
-    const profileId = parseInt(activeProfileSetting.value, 10);
+    const profileId = parseInt(activeProfileSetting, 10);
     const chain = db.prepare(`
       SELECT pm.model_db_id, pm.priority, pm.enabled,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -536,10 +559,12 @@ function getActiveChain(db: Db): ChainRow[] {
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.key_id
       FROM profile_models pm
-      JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+      JOIN models m ON m.id = pm.model_db_id
+      JOIN profiles p ON p.id = pm.profile_id AND p.user_id = ?
       WHERE pm.profile_id = ?
+        AND ${MODEL_VISIBLE_ENABLED}
       ORDER BY pm.priority ASC
-    `).all(profileId) as ChainRow[];
+    `).all(userId, profileId, userId, userId) as ChainRow[];
     
     if (chain.length > 0) return chain;
   }
@@ -551,13 +576,16 @@ function getActiveChain(db: Db): ChainRow[] {
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id
     FROM fallback_config fc
-    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+    JOIN models m ON m.id = fc.model_db_id
+    WHERE fc.user_id = ?
+      AND ${MODEL_VISIBLE_ENABLED}
     ORDER BY fc.priority ASC
-  `).all() as ChainRow[];
+  `).all(userId, userId, userId) as ChainRow[];
 }
 
 function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
-  const profile = db.prepare("SELECT id FROM profiles WHERE LOWER(name) = ?").get(name.toLowerCase()) as { id: number } | undefined;
+  const userId = requireUserId();
+  const profile = db.prepare("SELECT id FROM profiles WHERE user_id = ? AND LOWER(name) = ?").get(userId, name.toLowerCase()) as { id: number } | undefined;
   if (!profile) return null;
 
   return db.prepare(`
@@ -567,13 +595,15 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id
     FROM profile_models pm
-    JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+    JOIN models m ON m.id = pm.model_db_id
     WHERE pm.profile_id = ?
+      AND ${MODEL_VISIBLE_ENABLED}
     ORDER BY pm.priority ASC
-  `).all(profile.id) as ChainRow[];
+  `).all(profile.id, userId, userId) as ChainRow[];
 }
 
 function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
+  const userId = requireUserId();
   const allEnabled = db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -581,8 +611,8 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id
     FROM models m
-    WHERE m.enabled = 1
-  `).all() as ChainRow[];
+    WHERE ${MODEL_VISIBLE_ENABLED}
+  `).all(userId, userId) as ChainRow[];
 
   const strategyMap: Record<string, RoutingStrategy> = {
     'smart': 'smartest',
@@ -654,6 +684,7 @@ export function resolveRoutingChain(modelString: string | undefined): ResolvedCh
  */
 function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): RouteResult | null {
   const db = getDb();
+  const userId = requireUserId();
   const label = `${entry.platform}/${entry.model_id}`;
 
   if (!hasProvider(entry.platform as Platform)) {
@@ -663,8 +694,8 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   const provider = getProvider(entry.platform as Platform)!;
 
   const keys = db.prepare(
-    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(entry.platform) as KeyRow[];
+    "SELECT * FROM api_keys WHERE platform = ? AND user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all(entry.platform, userId) as KeyRow[];
   if (keys.length === 0) {
     diag?.push(`${label}: no enabled+healthy key for platform`);
     return null;
@@ -755,10 +786,13 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
  */
 export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, skipKeys?: Set<string>): boolean {
   const db = getDb();
+  const userId = requireUserId();
   const m = db.prepare(`
     SELECT platform, model_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, key_id
-      FROM models WHERE id = ?
-  `).get(modelDbId) as {
+      FROM models m
+     WHERE m.id = ?
+       AND ${MODEL_VISIBLE_ENABLED}
+  `).get(modelDbId, userId, userId) as {
     platform: string; model_id: string;
     rpm_limit: number | null; rpd_limit: number | null;
     tpm_limit: number | null; tpd_limit: number | null; key_id: number | null;
@@ -767,8 +801,8 @@ export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, ski
 
   const limits = { rpm: m.rpm_limit, rpd: m.rpd_limit, tpm: m.tpm_limit, tpd: m.tpd_limit };
   const keys = db.prepare(
-    "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(m.platform) as { id: number }[];
+    "SELECT id FROM api_keys WHERE platform = ? AND user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all(m.platform, userId) as { id: number }[];
 
   for (const k of keys) {
     if (k.id === excludingKeyId) continue;
@@ -792,6 +826,7 @@ export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, ski
  * Fetch a single enabled model's chain row by its db id.
  */
 function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
+  const userId = requireUserId();
   return db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -799,8 +834,8 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id
     FROM models m
-    WHERE m.id = ? AND m.enabled = 1
-  `).get(modelDbId) as ChainRow | undefined;
+    WHERE m.id = ? AND ${MODEL_VISIBLE_ENABLED}
+  `).get(modelDbId, userId, userId) as ChainRow | undefined;
 }
 
 /**
@@ -836,6 +871,7 @@ export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skip
  */
 export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
   const db = getDb();
+  const userId = requireUserId();
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
@@ -847,13 +883,13 @@ export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id
     FROM models m
-    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-    WHERE m.id = ? AND m.enabled = 1
+    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id AND fc.user_id = ?
+    WHERE m.id = ? AND ${MODEL_VISIBLE_ENABLED}
   `);
 
   const rows: ChainRow[] = [];
   for (const id of memberDbIds) {
-    const row = selectMember.get(id) as ChainRow | undefined;
+    const row = selectMember.get(userId, id, userId, userId) as ChainRow | undefined;
     if (row && row.enabled) rows.push(row);
   }
   return orderChain(rows, strategy);
@@ -879,6 +915,7 @@ export interface FusionCandidate {
  */
 export function getOrderedFusionChain(): FusionCandidate[] {
   const db = getDb();
+  const userId = requireUserId();
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
   const chain = getActiveChain(db).filter(e => e.enabled);
@@ -893,8 +930,8 @@ export function getOrderedFusionChain(): FusionCandidate[] {
   // can't fill — surfacing as "no available key" and pushing out a usable model,
   // which also makes the panel look like it's ignoring the routing strategy.
   const usableKeys = db.prepare(
-    "SELECT id, platform FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all() as { id: number; platform: string }[];
+    "SELECT id, platform FROM api_keys WHERE user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all(userId) as { id: number; platform: string }[];
   const keysByPlatform = new Map<string, number[]>();
   for (const k of usableKeys) {
     const arr = keysByPlatform.get(k.platform);
@@ -934,14 +971,15 @@ export function getOrderedFusionChain(): FusionCandidate[] {
  */
 export function resolveFusionCandidate(modelId: string): FusionCandidate | null {
   const db = getDb();
+  const userId = requireUserId();
   const row = db.prepare(`
     SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name,
            m.size_label, m.supports_vision, m.supports_tools
     FROM models m
-    WHERE m.model_id = ? AND m.enabled = 1
+    WHERE m.model_id = ? AND ${MODEL_VISIBLE_ENABLED}
     ORDER BY m.intelligence_rank ASC, m.id ASC
     LIMIT 1
-  `).get(modelId) as {
+  `).get(modelId, userId, userId) as {
     model_db_id: number; platform: string; model_id: string; display_name: string;
     size_label: string; supports_vision: number; supports_tools: number;
   } | undefined;
@@ -983,6 +1021,7 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
 
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false): RouteResult {
   const db = getDb();
+  const userId = requireUserId();
 
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
@@ -1010,8 +1049,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
                m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
                m.supports_tools, m.context_window, m.key_id
         FROM models m
-        WHERE m.id = ? AND m.enabled = 1
-      `).get(preferredModelDbId) as ChainRow | undefined;
+        WHERE m.id = ? AND ${MODEL_VISIBLE_ENABLED}
+      `).get(preferredModelDbId, userId, userId) as ChainRow | undefined;
       
       if (pinnedRow) {
         sortedChain.unshift(pinnedRow);
@@ -1104,6 +1143,7 @@ export interface RoutingScore {
 
 export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; scores: RoutingScore[] } {
   const db = getDb();
+  const userId = requireUserId();
   const strategy = getRoutingStrategy();
   refreshStatsCache(db);
 
@@ -1115,8 +1155,9 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
            m.supports_tools, m.context_window
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
-    WHERE m.enabled = 1
-  `).all() as ChainRow[];
+    WHERE fc.user_id = ?
+      AND ${MODEL_VISIBLE_ENABLED}
+  `).all(userId, userId, userId) as ChainRow[];
 
   // For display we score under 'balanced' weights when in priority mode, so the
   // table still shows a meaningful ranking even with the bandit turned off.
@@ -1128,7 +1169,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
 
   const scores: RoutingScore[] = chain.map(entry => {
     const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts);
-    const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+    const stats = getStatsCache()?.get(`${entry.platform}:${entry.model_id}`);
     return {
       modelDbId: entry.model_db_id,
       platform: entry.platform,
@@ -1157,12 +1198,15 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
 // the generic exhaustion message when none is configured (#118, #125).
 export function hasEnabledVisionModel(): boolean {
   const db = getDb();
+  const userId = requireUserId();
   const row = db.prepare(`
     SELECT COUNT(*) as cnt
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
-    WHERE fc.enabled = 1 AND m.enabled = 1 AND m.supports_vision = 1
-  `).get() as { cnt: number };
+    WHERE fc.user_id = ? AND fc.enabled = 1
+      AND ${MODEL_VISIBLE_ENABLED}
+      AND m.supports_vision = 1
+  `).get(userId, userId, userId) as { cnt: number };
   return row.cnt > 0;
 }
 
@@ -1171,11 +1215,14 @@ export function hasEnabledVisionModel(): boolean {
 // requests beats routing them to a model that mangles the tool call.
 export function hasEnabledToolsModel(): boolean {
   const db = getDb();
+  const userId = requireUserId();
   const row = db.prepare(`
     SELECT COUNT(*) as cnt
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
-    WHERE fc.enabled = 1 AND m.enabled = 1 AND m.supports_tools = 1
-  `).get() as { cnt: number };
+    WHERE fc.user_id = ? AND fc.enabled = 1
+      AND ${MODEL_VISIBLE_ENABLED}
+      AND m.supports_tools = 1
+  `).get(userId, userId, userId) as { cnt: number };
   return row.cnt > 0;
 }

@@ -30,6 +30,7 @@
 
 import crypto from 'crypto';
 import { getSetting } from '../db/index.js';
+import { getCurrentUserId } from '../lib/request-context.js';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 
 // ── Config (read on each call so tests and the dashboard can toggle live) ──
@@ -199,7 +200,9 @@ export function computeCacheKey(input: CacheKeyInput): string {
     logprobs: input.logprobs,
     top_logprobs: input.top_logprobs,
   });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
+  const hash = crypto.createHash('sha256').update(canonical).digest('hex');
+  const userId = getCurrentUserId() ?? 'anon';
+  return `${userId}:${hash}`;
 }
 
 // ── Store ──

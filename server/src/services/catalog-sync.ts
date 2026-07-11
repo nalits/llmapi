@@ -273,16 +273,31 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
     counts.removed += deleteTombstonedCatalogModels(db);
     applyAllModelOverrides(db);
 
-    // Ensure every model has a fallback_config row (same invariant migrations keep).
-    const missingFb = db
-      .prepare(
-        `SELECT m.id FROM models m LEFT JOIN fallback_config f ON m.id = f.model_db_id WHERE f.id IS NULL`,
-      )
-      .all() as { id: number }[];
-    if (missingFb.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      missingFb.forEach((r, i) => addFb.run(r.id, maxPriority + 1 + i));
+    // Ensure every user has a fallback_config row for every catalog/custom model
+    // they can see (same invariant migrations keep, now per-user).
+    const users = db.prepare('SELECT id FROM users').all() as Array<{ id: number }>;
+    const addFb = db.prepare(
+      'INSERT OR IGNORE INTO fallback_config (user_id, model_db_id, priority, enabled) VALUES (?, ?, ?, 1)',
+    );
+    for (const u of users) {
+      const missingFb = db
+        .prepare(`
+          SELECT m.id FROM models m
+          WHERE (m.user_id IS NULL OR m.user_id = ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM fallback_config f
+              WHERE f.user_id = ? AND f.model_db_id = m.id
+            )
+          ORDER BY m.intelligence_rank ASC, m.id ASC
+        `)
+        .all(u.id, u.id) as { id: number }[];
+      if (missingFb.length === 0) continue;
+      const maxPriority = (
+        db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config WHERE user_id = ?').get(u.id) as {
+          mx: number;
+        }
+      ).mx;
+      missingFb.forEach((r, i) => addFb.run(u.id, r.id, maxPriority + 1 + i));
     }
 
     // Remove catalog-managed models that the catalog no longer lists.
@@ -486,6 +501,7 @@ export function reapplyCachedCatalog(): { reapplied: boolean; version?: string }
     const raw = getSetting(SETTING_APPLIED_JSON);
     if (!raw) {
       if (getSetting(SETTING_APPLIED_VERSION)) {
+        getDb().prepare('DELETE FROM instance_settings WHERE key = ?').run(SETTING_APPLIED_VERSION);
         getDb().prepare('DELETE FROM settings WHERE key = ?').run(SETTING_APPLIED_VERSION);
       }
       return { reapplied: false };

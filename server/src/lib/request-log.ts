@@ -1,6 +1,7 @@
 import { getDb } from '../db/index.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
 import { getClientContext } from './client-context.js';
+import { requireUserId } from './request-context.js';
 
 type LogTx = ReturnType<typeof getDb>;
 
@@ -11,21 +12,21 @@ function hourKey(createdAt: string): string {
   return createdAt.slice(0, 13) + ':00:00';
 }
 
-function incrementSetting(db: LogTx, key: string, delta: number): void {
+function incrementSetting(db: LogTx, userId: number, key: string, delta: number): void {
   // Read-then-write inside the same transaction; safe because better-sqlite3
   // is synchronous and serialized at the connection level. ON CONFLICT keeps
   // the first ever insert without a prior SELECT.
   db.prepare(`
-    INSERT INTO settings (key, value) VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)
-  `).run(key, String(delta), delta);
+    INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)
+    ON CONFLICT(user_id, key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)
+  `).run(userId, key, String(delta), delta);
 }
 
-function setSettingIfMissing(db: LogTx, key: string, value: string): void {
+function setSettingIfMissing(db: LogTx, userId: number, key: string, value: string): void {
   db.prepare(`
-    INSERT INTO settings (key, value) VALUES (?, ?)
-    ON CONFLICT(key) DO NOTHING
-  `).run(key, value);
+    INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)
+    ON CONFLICT(user_id, key) DO NOTHING
+  `).run(userId, key, value);
 }
 
 // Append a row to the request analytics table. Shared by the chat proxy, the
@@ -60,11 +61,12 @@ export function logRequest(
     // Caller identity from the request-scoped context (set by the express
     // middleware); null when logging happens outside an HTTP request.
     const client = getClientContext();
+    const userId = requireUserId();
     const tx = db.transaction(() => {
       const insert = db.prepare(`
-        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, client_ip, client_user_agent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, client.ip, client.userAgent);
+        INSERT INTO requests (user_id, platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, client_ip, client_user_agent)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(userId, platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, client.ip, client.userAgent);
 
       const createdAt = db.prepare(`SELECT created_at FROM requests WHERE id = ?`).get(insert.lastInsertRowid) as { created_at: string } | undefined;
       const hour = hourKey(createdAt?.created_at ?? new Date().toISOString().slice(0, 19).replace('T', ' '));
@@ -72,21 +74,21 @@ export function logRequest(
       const isError = status === 'error' ? 1 : 0;
 
       db.prepare(`
-        INSERT INTO request_hourly (hour, total_requests, success_count, error_count, input_tokens, output_tokens)
-        VALUES (?, 1, ?, ?, ?, ?)
-        ON CONFLICT(hour) DO UPDATE SET
+        INSERT INTO request_hourly (user_id, hour, total_requests, success_count, error_count, input_tokens, output_tokens)
+        VALUES (?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT(user_id, hour) DO UPDATE SET
           total_requests = total_requests + 1,
           success_count  = success_count + ?,
           error_count    = error_count + ?,
           input_tokens   = input_tokens + ?,
           output_tokens  = output_tokens + ?
-      `).run(hour, isSuccess, isError, inputTokens, outputTokens, isSuccess, isError, inputTokens, outputTokens);
+      `).run(userId, hour, isSuccess, isError, inputTokens, outputTokens, isSuccess, isError, inputTokens, outputTokens);
 
-      incrementSetting(db, 'total_requests', 1);
-      incrementSetting(db, 'total_input_tokens', inputTokens);
-      incrementSetting(db, 'total_output_tokens', outputTokens);
+      incrementSetting(db, userId, 'total_requests', 1);
+      incrementSetting(db, userId, 'total_input_tokens', inputTokens);
+      incrementSetting(db, userId, 'total_output_tokens', outputTokens);
       if (createdAt?.created_at) {
-        setSettingIfMissing(db, 'first_request_at', createdAt.created_at);
+        setSettingIfMissing(db, userId, 'first_request_at', createdAt.created_at);
       }
     });
     tx();

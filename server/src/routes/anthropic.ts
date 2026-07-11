@@ -10,13 +10,12 @@ import type {
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
 import { routeRequest, routingReserveTokens, type RouteResult } from '../services/router.js';
-import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { logRequest } from '../lib/request-log.js';
-import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
+import { getStickyModel, setStickyModel } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -129,13 +128,8 @@ function newMessageId(): string {
 }
 
 // ── Auth (shared with the OpenAI route) ─────────────────────────────────────
-function authenticate(req: Request, res: Response): boolean {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    sendError(res, 401, 'authentication_error', 'Invalid API key');
-    return false;
-  }
+function authenticate(_req: Request, _res: Response): boolean {
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
   return true;
 }
 

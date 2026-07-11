@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { requireUserId } from '../lib/request-context.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { deleteUnusedCustomEndpointKey } from '../lib/custom-provider-cleanup.js';
 import { listAllMediaModels } from '../services/media.js';
@@ -142,9 +143,9 @@ mediaRouter.post('/custom', (req: Request, res: Response) => {
 
     const model = db.prepare(`
       INSERT INTO media_models
-        (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id)
-      VALUES ('custom', ?, ?, ?, ?, 1, ?, ?)
-    `).run(modelId, displayName, parsed.data.modality, priority, quotaLabel, keyId);
+        (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id, user_id)
+      VALUES ('custom', ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(modelId, displayName, parsed.data.modality, priority, quotaLabel, keyId, requireUserId());
     return { modelDbId: Number(model.lastInsertRowid), keyId, storedKeyForMask };
   });
 

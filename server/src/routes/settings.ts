@@ -11,6 +11,11 @@ import {
   REQUEST_MAX_TOKENS_BUDGET_SETTING,
   MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING,
 } from '../lib/guardrails.js';
+import {
+  ensureEnrollmentInviteCode,
+  rotateEnrollmentInviteCode,
+} from '../services/auth.js';
+import { requireAdmin } from '../middleware/requireAuth.js';
 import { z } from 'zod';
 
 export const settingsRouter = Router();
@@ -123,6 +128,16 @@ settingsRouter.get('/api-key', (_req: Request, res: Response) => {
 settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
   const newKey = regenerateUnifiedKey();
   res.json({ apiKey: newKey });
+});
+
+// Admin-only: view the shared enrollment invite code.
+settingsRouter.get('/invite-code', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ inviteCode: ensureEnrollmentInviteCode() });
+});
+
+// Admin-only: rotate the enrollment invite code (invalidates the previous one).
+settingsRouter.post('/invite-code/rotate', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ inviteCode: rotateEnrollmentInviteCode() });
 });
 
 // Get the proxy settings

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getDb, setSetting } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { deleteUnusedCustomEndpointKey } from '../lib/custom-provider-cleanup.js';
+import { requireUserId } from '../lib/request-context.js';
 import {
   listEmbeddingModels,
   getDefaultFamily,
@@ -200,9 +201,9 @@ embeddingsRouter.post('/custom', async (req: Request, res: Response) => {
 
     const model = db.prepare(`
       INSERT INTO embedding_models
-        (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label, key_id)
-      VALUES (?, 'custom', ?, ?, ?, ?, ?, 1, ?, ?)
-    `).run(family, modelId, displayName, dimensions, parsed.data.maxInputTokens ?? null, priority, quotaLabel, keyId);
+        (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label, key_id, user_id)
+      VALUES (?, 'custom', ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(family, modelId, displayName, dimensions, parsed.data.maxInputTokens ?? null, priority, quotaLabel, keyId, requireUserId());
     return { modelDbId: Number(model.lastInsertRowid), keyId, storedKeyForMask };
   });
 

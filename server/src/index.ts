@@ -10,7 +10,7 @@ import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
 import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
 import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
-import { userCount } from './services/auth.js';
+import { userCount, logEnrollmentSetupCode } from './services/auth.js';
 import { generateSetupCode } from './lib/setup-code.js';
 import { warnOnEnvDrift } from './lib/env-drift.js';
 
@@ -33,11 +33,13 @@ async function main() {
   initDb(config.dbPath ?? undefined);
   applyDeclarativeConfigFromEnv();
 
-  // First-run hardening: when the dashboard is still unclaimed, mint a one-time
-  // setup code and log it. A loopback browser can finish setup without it; a
-  // remote caller must supply it (see routes/auth.ts). Regenerated each boot.
+  // Setup-code gate: unclaimed installs mint a first-run code (loopback can
+  // skip it; remote must present it). After an admin exists, log the shared
+  // enrollment setup code so every later signup can use the same secret.
   if (userCount() === 0) {
     generateSetupCode();
+  } else {
+    logEnrollmentSetupCode();
   }
 
   // Load the persisted proxy settings from the DB (env var wins if set).

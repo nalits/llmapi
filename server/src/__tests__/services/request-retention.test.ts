@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
+import { requireUserId } from '../../lib/request-context.js';
 import { getRequestAnalyticsRetentionConfig, pruneRequestAnalytics } from '../../services/request-retention.js';
 
 const ORIGINAL_RETENTION_DAYS = process.env.REQUEST_ANALYTICS_RETENTION_DAYS;
@@ -90,16 +91,25 @@ describe('request analytics retention', () => {
     // Hourly buckets never auto-create themselves in this test (logRequest is
     // the only writer), so seed them by hand to exercise the prune path.
     const db = getDb();
-    db.prepare(`CREATE TABLE IF NOT EXISTS request_hourly (
-      hour TEXT PRIMARY KEY, total_requests INTEGER NOT NULL DEFAULT 0
+    const userId = requireUserId();
+    db.prepare(`DROP TABLE IF EXISTS request_hourly`).run();
+    db.prepare(`CREATE TABLE request_hourly (
+      user_id INTEGER NOT NULL,
+      hour TEXT NOT NULL,
+      total_requests INTEGER NOT NULL DEFAULT 0,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      error_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, hour)
     )`).run();
-    const upsert = db.prepare(`INSERT INTO request_hourly (hour, total_requests) VALUES (?, ?)
-      ON CONFLICT(hour) DO UPDATE SET total_requests = excluded.total_requests`);
+    const upsert = db.prepare(`INSERT INTO request_hourly (user_id, hour, total_requests) VALUES (?, ?, ?)
+      ON CONFLICT(user_id, hour) DO UPDATE SET total_requests = excluded.total_requests`);
     // Seed in the same 'YYYY-MM-DD HH:00:00' (space) format production writes,
     // so the prune cutoff (also space) compares apples-to-apples.
-    upsert.run('2026-05-01 00:00:00', 5);   // outside 30d window from May 31
-    upsert.run('2026-05-15 00:00:00', 3);   // inside
-    upsert.run('2026-05-31 00:00:00', 7);   // boundary hour, kept
+    upsert.run(userId, '2026-05-01 00:00:00', 5);   // outside 30d window from May 31
+    upsert.run(userId, '2026-05-15 00:00:00', 3);   // inside
+    upsert.run(userId, '2026-05-31 00:00:00', 7);   // boundary hour, kept
 
     // First call (cold gate): should prune the May 1 row and leave the rest.
     const first = pruneRequestAnalytics({

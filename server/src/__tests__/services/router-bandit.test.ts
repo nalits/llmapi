@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  routeRequest, refreshStatsCache, getRoutingStrategy, setRoutingStrategy, getRoutingScores,
+  routeRequest, refreshStatsCache, clearStatsCache, getRoutingStrategy, setRoutingStrategy, getRoutingScores,
   getCustomWeights, setCustomWeights,
 } from '../../services/router.js';
 import * as ratelimit from '../../services/ratelimit.js';
 import { getDb, initDb } from '../../db/index.js';
+import { requireUserId } from '../../lib/request-context.js';
 
 vi.mock('../../services/ratelimit.js', async () => {
   const actual = await vi.importActual('../../services/ratelimit.js');
@@ -30,18 +31,18 @@ function addModel(opts: {
   intelligenceRank: number; sizeLabel: string; budget: string; priority: number;
 }): number {
   const db = getDb();
+  const userId = requireUserId();
   db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled)
     VALUES (?, ?, ?, ?, ?, ?, ?, 1)
   `).run(opts.platform, opts.modelId, opts.name, opts.intelligenceRank, 1, opts.sizeLabel, opts.budget);
   const id = (db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
     .get(opts.platform, opts.modelId) as { id: number }).id;
-  db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, opts.priority);
-  // every platform needs at least one healthy key to be routable
+  db.prepare('INSERT INTO fallback_config (user_id, model_db_id, priority, enabled) VALUES (?, ?, ?, 1)').run(userId, id, opts.priority);
   db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-    VALUES (?, 'k', 'enc', 'iv', 'tag', 'healthy', 1)
-  `).run(opts.platform);
+    INSERT INTO api_keys (user_id, platform, label, encrypted_key, iv, auth_tag, status, enabled)
+    VALUES (?, ?, 'k', 'enc', 'iv', 'tag', 'healthy', 1)
+  `).run(userId, opts.platform);
   return id;
 }
 
@@ -50,15 +51,16 @@ function addHistory(platform: string, modelId: string, opts: {
   successes: number; failures: number; outTokens?: number; latencyMs?: number; ttfbMs?: number | null;
 }) {
   const db = getDb();
+  const userId = requireUserId();
   const ins = db.prepare(`
-    INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms)
-    VALUES (?, ?, 1, ?, 0, ?, ?, ?, ?)
+    INSERT INTO requests (user_id, platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms)
+    VALUES (?, ?, ?, 1, ?, 0, ?, ?, ?, ?)
   `);
   for (let i = 0; i < opts.successes; i++) {
-    ins.run(platform, modelId, 'success', opts.outTokens ?? 100, opts.latencyMs ?? 1000, null, opts.ttfbMs ?? null);
+    ins.run(userId, platform, modelId, 'success', opts.outTokens ?? 100, opts.latencyMs ?? 1000, null, opts.ttfbMs ?? null);
   }
   for (let i = 0; i < opts.failures; i++) {
-    ins.run(platform, modelId, 'error', 0, opts.latencyMs ?? 1000, 'boom', opts.ttfbMs ?? null);
+    ins.run(userId, platform, modelId, 'error', 0, opts.latencyMs ?? 1000, 'boom', opts.ttfbMs ?? null);
   }
 }
 
@@ -76,9 +78,10 @@ describe('bandit router', () => {
     process.env.DEV_MODE = 'true';
     process.env.NODE_ENV = 'test';
     initDb(':memory:');
+    clearStatsCache();
     // initDb seeds the real catalog; wipe it so each test controls its own
     // models/keys/history (and seeded models don't share a platform with ours).
-    getDb().exec('DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests;');
+    getDb().exec('DELETE FROM profile_models; DELETE FROM profiles; DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests; DELETE FROM settings; DELETE FROM users; DELETE FROM user_api_keys;');
     vi.clearAllMocks();
     (ratelimit.canMakeRequest as any).mockReturnValue(true);
     (ratelimit.canUseTokens as any).mockReturnValue(true);

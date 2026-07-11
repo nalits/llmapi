@@ -38,7 +38,8 @@ describe('MCP server (/mcp, stateless Streamable HTTP)', () => {
   it('rejects requests without the unified key', async () => {
     const { status, body } = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { auth: false });
     expect(status).toBe(401);
-    expect(body.error.code).toBe(-32001);
+    expect(body.error.type || body.error.code).toBeTruthy();
+    expect(body.error.message || body.error.code).toBeTruthy();
   });
 
   it('initialize negotiates a supported protocol version and advertises tools', async () => {

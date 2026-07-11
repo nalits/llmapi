@@ -24,6 +24,7 @@ import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter } from './middleware/rateLimit.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { clientContextMiddleware } from './lib/client-context.js';
+import { requireUnifiedApiKey } from './lib/api-auth.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
 
@@ -92,6 +93,8 @@ export function createApp(config?: Config) {
   // it throttles unauthenticated brute-force / flood attempts before any
   // routing work. Tune via PROXY_RATE_LIMIT_RPM; 0 disables it.
   app.use('/v1', createProxyRateLimiter(cfg.proxyRateLimitRpm));
+  // Per-user unified API key → binds AsyncLocalStorage user context for /v1.
+  app.use('/v1', requireUnifiedApiKey);
   // Anthropic-compatible Messages API (`POST /v1/messages`, `/count_tokens`) for
   // Claude Code and anything else speaking the Anthropic SDK. Mounted BEFORE the
   // OpenAI router so it can content-negotiate `GET /v1/models` (Anthropic shape
@@ -102,9 +105,8 @@ export function createApp(config?: Config) {
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
 
-  // MCP server (Model Context Protocol over stateless Streamable HTTP):
-  // gateway introspection tools for MCP-speaking agents. Unified-key auth,
-  // like /v1 — NOT behind the dashboard session gate.
+  // MCP server (Model Context Protocol over stateless Streamable HTTP).
+  // Auth is applied inside the router so GET/DELETE can return 405 without a key.
   app.use('/mcp', mcpRouter);
 
   // Health check

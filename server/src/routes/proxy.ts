@@ -7,7 +7,7 @@ import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, recordR
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runImageGeneration, runSpeech, MediaError } from '../services/media.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getDb } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -196,12 +196,7 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
 // OpenAI-compatible /models endpoint (used by Hermes for metadata) 
 // shows API models which is linked by the user
 proxyRouter.get('/models', (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
 
   // By default we return the WHOLE catalog (one row per model id), each tagged
   // with whether it is currently usable, so a client can see everything and know
@@ -460,12 +455,7 @@ const EmbeddingsBody = z.object({
 });
 
 proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
   const parsed = EmbeddingsBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request: `input` is required', type: 'invalid_request_error' } });
@@ -508,12 +498,7 @@ function mediaErrorType(status: number): string {
 }
 
 proxyRouter.post('/images/generations', async (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
   const parsed = ImageBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request: `prompt` is required', type: 'invalid_request_error' } });
@@ -546,12 +531,7 @@ const SpeechBody = z.object({
 });
 
 proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
   const parsed = SpeechBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request: `input` is required', type: 'invalid_request_error' } });
@@ -634,14 +614,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   const requestGroupId = getRequestGroupId(req);
   res.setHeader('X-Request-ID', requestGroupId);
 
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({
-      error: { message: 'Invalid API key', type: 'authentication_error' },
-    });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
 
   const parsed = CompletionBody.safeParse(req.body);
   if (!parsed.success) {
@@ -958,17 +931,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const requestGroupId = getRequestGroupId(req);
   res.setHeader('X-Request-ID', requestGroupId);
 
-  // Authenticate with the unified API key for every proxy request, including
-  // loopback callers. Browser pages can reach localhost, so socket locality is
-  // not a reliable authorization boundary.
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-    res.status(401).json({
-      error: { message: 'Invalid API key', type: 'authentication_error' },
-    });
-    return;
-  }
+  // Auth: requireUnifiedApiKey middleware (app.ts) binds per-user context.
 
   // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);

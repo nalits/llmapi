@@ -1,4 +1,5 @@
 import type { Db } from '../db/types.js';
+import { getCurrentUserId, requireUserId, runWithUser } from '../lib/request-context.js';
 
 export type CatalogModelKind = 'chat' | 'media';
 
@@ -69,9 +70,12 @@ export function isCatalogModelTombstoned(
   platform: string,
   modelId: string,
 ): boolean {
+  // Catalog sync runs without a user; per-user tombstones must not block shared inserts.
+  const userId = getCurrentUserId();
+  if (userId == null) return false;
   return !!db
-    .prepare('SELECT 1 FROM catalog_model_tombstones WHERE kind = ? AND platform = ? AND model_id = ?')
-    .get(kind, platform, modelId);
+    .prepare('SELECT 1 FROM catalog_model_tombstones WHERE user_id = ? AND kind = ? AND platform = ? AND model_id = ?')
+    .get(userId, kind, platform, modelId);
 }
 
 export function recordCatalogModelTombstone(
@@ -80,13 +84,14 @@ export function recordCatalogModelTombstone(
   platform: string,
   modelId: string,
 ): void {
+  const userId = requireUserId();
   db.prepare(`
-    INSERT INTO catalog_model_tombstones (kind, platform, model_id)
-    VALUES (?, ?, ?)
-    ON CONFLICT(kind, platform, model_id) DO UPDATE SET created_at = datetime('now')
-  `).run(kind, platform, modelId);
+    INSERT INTO catalog_model_tombstones (user_id, kind, platform, model_id)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, kind, platform, model_id) DO UPDATE SET created_at = datetime('now')
+  `).run(userId, kind, platform, modelId);
   if (kind === 'chat') {
-    db.prepare('DELETE FROM model_overrides WHERE platform = ? AND model_id = ?').run(platform, modelId);
+    db.prepare('DELETE FROM model_overrides WHERE user_id = ? AND platform = ? AND model_id = ?').run(userId, platform, modelId);
   }
 }
 
@@ -96,8 +101,9 @@ export function clearCatalogModelTombstone(
   platform: string,
   modelId: string,
 ): void {
-  db.prepare('DELETE FROM catalog_model_tombstones WHERE kind = ? AND platform = ? AND model_id = ?')
-    .run(kind, platform, modelId);
+  const userId = requireUserId();
+  db.prepare('DELETE FROM catalog_model_tombstones WHERE user_id = ? AND kind = ? AND platform = ? AND model_id = ?')
+    .run(userId, kind, platform, modelId);
 }
 
 export function upsertModelOverrides(
@@ -106,18 +112,19 @@ export function upsertModelOverrides(
   modelId: string,
   patch: ModelOverridePatch,
 ): StoredOverrides {
+  const userId = requireUserId();
   const cleaned = cleanPatch(patch);
   if (Object.keys(cleaned).length === 0) return {};
   const existing = db
-    .prepare('SELECT overrides_json FROM model_overrides WHERE platform = ? AND model_id = ?')
-    .get(platform, modelId) as { overrides_json: string } | undefined;
+    .prepare('SELECT overrides_json FROM model_overrides WHERE user_id = ? AND platform = ? AND model_id = ?')
+    .get(userId, platform, modelId) as { overrides_json: string } | undefined;
   const merged: StoredOverrides = { ...parseOverrides(existing?.overrides_json), ...cleaned };
   db.prepare(`
-    INSERT INTO model_overrides (platform, model_id, overrides_json, updated_at)
-    VALUES (?, ?, ?, datetime('now'))
-    ON CONFLICT(platform, model_id)
+    INSERT INTO model_overrides (user_id, platform, model_id, overrides_json, updated_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(user_id, platform, model_id)
     DO UPDATE SET overrides_json = excluded.overrides_json, updated_at = excluded.updated_at
-  `).run(platform, modelId, JSON.stringify(merged));
+  `).run(userId, platform, modelId, JSON.stringify(merged));
   return merged;
 }
 
@@ -126,9 +133,10 @@ export function getModelOverrides(
   platform: string,
   modelId: string,
 ): StoredOverrides {
+  const userId = requireUserId();
   const row = db
-    .prepare('SELECT overrides_json FROM model_overrides WHERE platform = ? AND model_id = ?')
-    .get(platform, modelId) as { overrides_json: string } | undefined;
+    .prepare('SELECT overrides_json FROM model_overrides WHERE user_id = ? AND platform = ? AND model_id = ?')
+    .get(userId, platform, modelId) as { overrides_json: string } | undefined;
   return parseOverrides(row?.overrides_json);
 }
 
@@ -153,40 +161,55 @@ export function applyModelOverrides(
 }
 
 export function applyAllModelOverrides(db: Db): number {
-  const rows = db.prepare('SELECT platform, model_id FROM model_overrides').all() as { platform: string; model_id: string }[];
+  const userId = getCurrentUserId();
   let applied = 0;
-  for (const row of rows) {
-    if (applyModelOverrides(db, row.platform, row.model_id)) applied++;
+  if (userId != null) {
+    const rows = db.prepare('SELECT platform, model_id FROM model_overrides WHERE user_id = ?')
+      .all(userId) as { platform: string; model_id: string }[];
+    for (const row of rows) {
+      if (applyModelOverrides(db, row.platform, row.model_id)) applied++;
+    }
+    return applied;
+  }
+  // Catalog sync (no ALS): apply each owner's overrides under their context.
+  const owners = db.prepare('SELECT DISTINCT user_id FROM model_overrides').all() as { user_id: number }[];
+  for (const owner of owners) {
+    runWithUser(owner.user_id, () => {
+      const owned = db.prepare('SELECT platform, model_id FROM model_overrides WHERE user_id = ?')
+        .all(owner.user_id) as { platform: string; model_id: string }[];
+      for (const row of owned) {
+        if (applyModelOverrides(db, row.platform, row.model_id)) applied++;
+      }
+    });
   }
   return applied;
 }
 
 export function deleteTombstonedCatalogModels(db: Db): number {
+  const userId = getCurrentUserId();
+  // Per-user tombstones must not delete shared catalog rows for everyone.
+  // When bound to a user, drop that user's fallback entries for tombstoned models.
+  if (userId == null) return 0;
+
   const chatRows = db.prepare(`
     SELECT m.id, m.platform, m.model_id
       FROM models m
       JOIN catalog_model_tombstones t
-        ON t.kind = 'chat' AND t.platform = m.platform AND t.model_id = m.model_id
+        ON t.user_id = ? AND t.kind = 'chat' AND t.platform = m.platform AND t.model_id = m.model_id
      WHERE m.platform != 'custom' AND m.key_id IS NULL
-  `).all() as { id: number; platform: string; model_id: string }[];
+  `).all(userId) as { id: number; platform: string; model_id: string }[];
   const mediaRows = db.prepare(`
     SELECT mm.id
       FROM media_models mm
       JOIN catalog_model_tombstones t
-        ON t.kind = 'media' AND t.platform = mm.platform AND t.model_id = mm.model_id
-  `).all() as { id: number }[];
+        ON t.user_id = ? AND t.kind = 'media' AND t.platform = mm.platform AND t.model_id = mm.model_id
+  `).all(userId) as { id: number }[];
 
-  const deleteChatFallback = db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?');
-  const deleteChat = db.prepare('DELETE FROM models WHERE id = ?');
-  const deleteMedia = db.prepare('DELETE FROM media_models WHERE id = ?');
-
+  const deleteChatFallback = db.prepare('DELETE FROM fallback_config WHERE model_db_id = ? AND user_id = ?');
   for (const row of chatRows) {
-    deleteChatFallback.run(row.id);
-    deleteChat.run(row.id);
-  }
-  for (const row of mediaRows) {
-    deleteMedia.run(row.id);
+    deleteChatFallback.run(row.id, userId);
   }
 
+  // Media rows stay in the shared table; listing filters tombstones per user.
   return chatRows.length + mediaRows.length;
 }

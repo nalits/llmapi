@@ -257,14 +257,20 @@ describe('custom provider modalities', () => {
     expect(media.status).toBe(201);
     expect(media.body.keyId).toBe(embedding.body.keyId);
 
-    getDb().prepare("UPDATE settings SET value = 'local-delete-family' WHERE key = 'embeddings_default_family'").run();
+    const userId = (getDb().prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as { id: number }).id;
+    getDb().prepare(`
+      INSERT INTO settings (user_id, key, value) VALUES (?, 'embeddings_default_family', 'local-delete-family')
+      ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
+    `).run(userId);
 
     const removed = await del(app, `/api/keys/${embedding.body.keyId}`);
     expect(removed.status).toBe(200);
 
     expect((getDb().prepare("SELECT COUNT(*) AS n FROM embedding_models WHERE platform = 'custom'").get() as { n: number }).n).toBe(0);
     expect((getDb().prepare("SELECT COUNT(*) AS n FROM media_models WHERE platform = 'custom'").get() as { n: number }).n).toBe(0);
-    const def = getDb().prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string };
-    expect(def.value).not.toBe('local-delete-family');
+    const def = getDb().prepare(
+      "SELECT value FROM settings WHERE user_id = ? AND key = 'embeddings_default_family'",
+    ).get(userId) as { value: string } | undefined;
+    expect(def?.value).not.toBe('local-delete-family');
   });
 });

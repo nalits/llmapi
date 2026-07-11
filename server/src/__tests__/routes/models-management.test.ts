@@ -114,10 +114,12 @@ describe('Model management API', () => {
     expect(status).toBe(200);
     expect(body).toEqual({ success: true, tombstoned: true });
 
-    expect(getDb().prepare('SELECT id FROM models WHERE id = ?').get(target.id)).toBeUndefined();
+    // Catalog rows stay shared; the model is hidden for this user via tombstone.
+    expect(getDb().prepare('SELECT id FROM models WHERE id = ?').get(target.id)).toBeDefined();
     expect(getDb().prepare(`
       SELECT 1 FROM catalog_model_tombstones
-       WHERE kind = 'chat' AND platform = ? AND model_id = ?
+       WHERE user_id = (SELECT id FROM users ORDER BY id ASC LIMIT 1)
+         AND kind = 'chat' AND platform = ? AND model_id = ?
     `).get(target.platform, target.model_id)).toBeDefined();
   });
 });

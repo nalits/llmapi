@@ -11,6 +11,7 @@ import { getDb, getSetting } from '../db/index.js';
 import { getClientContext } from '../lib/client-context.js';
 import { decrypt } from '../lib/crypto.js';
 import { proxyFetch } from '../lib/proxy.js';
+import { requireUserId } from '../lib/request-context.js';
 
 export interface EmbeddingModelRow {
   id: number;
@@ -70,10 +71,11 @@ interface ProviderCredential {
 }
 
 function getProviderCredential(row: EmbeddingModelRow): ProviderCredential | null {
+  const userId = requireUserId();
   if (row.key_id != null) {
     const keyRow = getDb().prepare(
-      "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') LIMIT 1",
-    ).get(row.key_id) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
+      "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') LIMIT 1",
+    ).get(row.key_id, userId) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
     if (!keyRow) return null;
     try {
       return {
@@ -88,8 +90,8 @@ function getProviderCredential(row: EmbeddingModelRow): ProviderCredential | nul
   if (row.platform === 'custom') return null;
 
   const keyRow = getDb().prepare(
-    "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY RANDOM() LIMIT 1",
-  ).get(row.platform) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
+    "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND user_id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY RANDOM() LIMIT 1",
+  ).get(row.platform, userId) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
   if (!keyRow) return null;
   try {
     return {
