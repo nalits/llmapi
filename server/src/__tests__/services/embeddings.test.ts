@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { MockedFunction } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { resolveFamily, getDefaultFamily, runEmbeddings, EmbeddingsError } from '../../services/embeddings.js';
+import { resolveFamily, getDefaultFamily, runEmbeddings } from '../../services/embeddings.js';
 
 const realFetch = globalThis.fetch;
 
@@ -49,6 +49,26 @@ describe('embeddings service', () => {
   afterEach(() => {
     globalThis.fetch = realFetch;
     vi.restoreAllMocks();
+  });
+
+  it('reserves the shared monthly budget across concurrent embeddings and releases failures', async () => {
+    const keyId = addCustomKey('https://embeddings.example/v1');
+    const db = getDb();
+    db.prepare('UPDATE api_keys SET monthly_request_cap = 1 WHERE id = ?').run(keyId);
+    db.prepare(`INSERT INTO embedding_models (family, platform, model_id, display_name, dimensions, priority, enabled, quota_label, key_id)
+      VALUES ('budget-embed', 'custom', 'budget-embed', 'Budget embedding', 2, 1, 1, '', ?)`).run(keyId);
+    let finish!: (response: Response) => void;
+    const fetchMock = mockFetch(() => new Promise<Response>(resolve => { finish = resolve; }));
+    const first = runEmbeddings('budget-embed', ['hello']);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await expect(runEmbeddings('budget-embed', ['hello'])).rejects.toMatchObject({ status: 429, code: 'quota_exceeded' });
+    finish(new Response('unavailable', { status: 503 }));
+    await expect(first).rejects.toMatchObject({ status: 502 });
+    fetchMock.mockResolvedValue(okEmbeddingResponse(2));
+    await expect(runEmbeddings('budget-embed', ['hello'])).resolves.toMatchObject({ inputTokens: 3 });
+    db.prepare('DELETE FROM requests').run();
+    await expect(runEmbeddings('budget-embed', ['hello'])).rejects.toMatchObject({ status: 429, code: 'quota_exceeded' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   describe('migration seed', () => {
@@ -173,6 +193,23 @@ describe('embeddings service', () => {
       expect(result.platform).toBe('huggingface');
       expect(result.dimensions).toBe(3);
       expect(String(fetchMock.mock.calls[0][0])).toContain('feature-extraction');
+    });
+
+    it('routes SEA-LION catalog embeddings through its OpenAI-compatible endpoint', async () => {
+      getDb().prepare(`
+        INSERT INTO embedding_models
+          (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label)
+        VALUES
+          ('sea-lion-e5-embedding-600m', 'sealion', 'aisingapore/SEA-LION-E5-Embedding-600M',
+           'SEA-LION E5 Embedding 600M', 1024, 8192, 1, 1, 'free · 10 rpm')
+      `).run();
+      addKey('sealion');
+      const fetchMock = mockFetch(async () => okEmbeddingResponse(1024));
+
+      const result = await runEmbeddings('sea-lion-e5-embedding-600m', ['hello']);
+
+      expect(result.platform).toBe('sealion');
+      expect(String(fetchMock.mock.calls[0][0])).toBe('https://api.sea-lion.ai/v1/embeddings');
     });
 
     it('rejects malformed upstream payloads and fails over', async () => {

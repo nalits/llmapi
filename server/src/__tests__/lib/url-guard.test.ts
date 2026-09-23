@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { classifyIp, assessProviderUrl } from '../../lib/url-guard.js';
+import { classifyIp, assessProviderUrl, isLoopbackOrPrivateUrl, isLoopbackOrPrivateHostname } from '../../lib/url-guard.js';
 
 // SSRF guard for user-supplied custom-provider base URLs (#440). Metadata and
 // link-local targets must never be reachable; loopback/private stay allowed by
@@ -138,5 +138,66 @@ describe('assessProviderUrl', () => {
       resolve: async () => { throw new Error('ENOTFOUND'); },
     });
     expect(verdict.allowed).toBe(true);
+  });
+});
+
+describe('isLoopbackOrPrivateUrl (#592 local-endpoint cooldown exemption)', () => {
+  it('true for loopback and localhost forms', () => {
+    expect(isLoopbackOrPrivateUrl('http://127.0.0.1:11434/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://localhost:11434/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://ollama.localhost/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://[::1]:8080/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://0.0.0.0:8080/v1')).toBe(true);
+  });
+
+  it('true for RFC1918 / ULA literal addresses', () => {
+    expect(isLoopbackOrPrivateUrl('http://192.168.1.50:8080/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://10.0.0.7:11434/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://172.16.4.2:5000/v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://[fd12:3456::1]:8080/v1')).toBe(true);
+  });
+
+  it('false for public addresses and hostnames (no DNS — pragmatically non-local)', () => {
+    expect(isLoopbackOrPrivateUrl('http://203.0.113.10/v1')).toBe(false);
+    expect(isLoopbackOrPrivateUrl('https://api.example.com/v1')).toBe(false);
+    expect(isLoopbackOrPrivateUrl('http://my-lan-box.local:11434/v1')).toBe(false); // mDNS: undecidable without DNS
+    expect(isLoopbackOrPrivateUrl('https://ollama.com/v1')).toBe(false); // Ollama CLOUD stays protected
+  });
+
+  it('false for null/empty/garbage input', () => {
+    expect(isLoopbackOrPrivateUrl(null)).toBe(false);
+    expect(isLoopbackOrPrivateUrl(undefined)).toBe(false);
+    expect(isLoopbackOrPrivateUrl('')).toBe(false);
+    expect(isLoopbackOrPrivateUrl('not a url')).toBe(false);
+  });
+
+  // The FQDN spelling resolves exactly like the bare name, so it must not slip
+  // through as "some public host" (#951 — it would then get proxied).
+  it('true for the trailing-dot FQDN spelling of localhost', () => {
+    expect(isLoopbackOrPrivateUrl('http://localhost./v1')).toBe(true);
+    expect(isLoopbackOrPrivateUrl('http://ollama.localhost./v1')).toBe(true);
+  });
+});
+
+describe('isLoopbackOrPrivateHostname (hostname half, used by the proxy router)', () => {
+  it('matches the same classes as the URL form', () => {
+    expect(isLoopbackOrPrivateHostname('127.0.0.2')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('0.0.0.0')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('[::1]')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('::1')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('LocalHost')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('localhost.')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('ollama.localhost')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('192.168.1.20')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('10.0.0.5')).toBe(true);
+    expect(isLoopbackOrPrivateHostname('[fd12:3456::1]')).toBe(true);
+  });
+
+  it('false for public hosts and names it cannot decide without DNS', () => {
+    expect(isLoopbackOrPrivateHostname('api.openai.com')).toBe(false);
+    expect(isLoopbackOrPrivateHostname('203.0.113.10')).toBe(false);
+    expect(isLoopbackOrPrivateHostname('notlocalhost')).toBe(false);
+    expect(isLoopbackOrPrivateHostname('my-lan-box.local')).toBe(false);
+    expect(isLoopbackOrPrivateHostname('')).toBe(false);
   });
 });

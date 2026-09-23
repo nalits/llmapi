@@ -7,7 +7,11 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 // contract enforcement.
 
 const { mockCheckKeyHealth } = vi.hoisted(() => ({ mockCheckKeyHealth: vi.fn() }));
-vi.mock('../../services/health.js', () => ({ checkKeyHealth: mockCheckKeyHealth }));
+vi.mock('../../services/health.js', () => ({
+  checkKeyHealth: mockCheckKeyHealth,
+  // recordUpstreamSuccess touches this on the streak-reset test path.
+  markKeyHealthyFromRequest: vi.fn(),
+}));
 
 import { initDb, getDb } from '../../db/index.js';
 import {
@@ -15,6 +19,9 @@ import {
   newFallbackState,
   cooldownForError,
   recordRetryableFailure,
+  recordUpstreamSuccess,
+  resetEmptyCompletionStreaks,
+  resetTruncationStreaks,
   exhaustedRetryError,
   formatAttemptTrail,
   classifyAttemptError,
@@ -22,10 +29,20 @@ import {
   getFallbackTimeBudgetMs,
   DEFAULT_FALLBACK_TIME_BUDGET_MS,
   AUTH_FAILURE_COOLDOWN_MS,
+  EMPTY_COMPLETION_STREAK_LIMIT,
+  TRUNCATION_STREAK_LIMIT,
+  TRUNCATION_BENCH_MS,
   type AttemptRecord,
   type FallbackHooks,
+  type FallbackState,
 } from '../../lib/fallback-loop.js';
-import { isKeyAuthError, isDailyQuotaExhaustedError } from '../../lib/error-classify.js';
+import {
+  isKeyAuthError,
+  isDailyQuotaExhaustedError,
+  isProviderLevelError,
+  newClientAbortError,
+} from '../../lib/error-classify.js';
+import { invalidToolArgumentsError } from '../../lib/tool-validate.js';
 import { getAllPenalties } from '../../services/router.js';
 import type { RouteResult } from '../../services/router.js';
 
@@ -68,6 +85,8 @@ beforeEach(() => {
   mockCheckKeyHealth.mockReset();
   mockCheckKeyHealth.mockResolvedValue('invalid');
   getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+  resetEmptyCompletionStreaks();
+  resetTruncationStreaks();
 });
 
 describe('isKeyAuthError (401 = key-fatal, rotate instead of 502)', () => {
@@ -163,6 +182,162 @@ describe('recordRetryableFailure skipBench exemption (reasoning truncation)', ()
     // modelDbId 424242 has no sibling key rows, so the penalty fires.
     expect(getAllPenalties().some(p => p.modelDbId === route.modelDbId)).toBe(true);
   });
+
+  it('skipModelForRequest rules out the whole model, not just the key', () => {
+    // Format-ignore is MODEL behavior: a sibling key reproduces it exactly, so
+    // burning one failover hop per key on the same model was pure waste.
+    const route = fakeRoute();
+    const state = newFallbackState();
+    const err = Object.assign(
+      new Error(`${route.displayName} ignored response_format (returned non-JSON despite json_schema)`),
+      { skipBench: true, skipModelForRequest: true },
+    );
+    recordRetryableFailure(route, err, state);
+
+    expect(state.skipModels.has(route.modelDbId)).toBe(true);
+    expect(state.skipKeys.has(`fake:fake-model:${route.keyId}`)).toBe(true);
+    // skipBench still applies: no cooldown, no penalty.
+    const cooldown = getDb().prepare('SELECT 1 FROM rate_limit_cooldowns WHERE platform = ? AND key_id = ?').get('fake', route.keyId);
+    expect(cooldown).toBeUndefined();
+    expect(getAllPenalties().some(p => p.modelDbId === route.modelDbId)).toBe(false);
+  });
+
+  it('classifyAttemptError buckets format-ignore and truncated-JSON as format_ignored', () => {
+    expect(classifyAttemptError(new Error('X ignored response_format (returned non-JSON despite json_object)'))).toBe('format_ignored');
+    expect(classifyAttemptError(new Error('truncated JSON from X (finish_reason=length — raise max_tokens for this json_schema request)'))).toBe('format_ignored');
+  });
+});
+
+describe('empty-completion streak lifts the skipBench exemption (#751)', () => {
+  const emptyLengthErr = (route: RouteResult) =>
+    Object.assign(new Error(`empty completion from ${route.displayName}`), { skipBench: true });
+  const cooldownFor = (route: RouteResult) =>
+    getDb().prepare('SELECT 1 FROM rate_limit_cooldowns WHERE platform = ? AND key_id = ?').get('fake', route.keyId);
+
+  it('benches + penalizes from the Nth consecutive empty completion on the same model+key', () => {
+    const route = fakeRoute();
+    for (let i = 1; i < EMPTY_COMPLETION_STREAK_LIMIT; i++) {
+      expect(recordRetryableFailure(route, emptyLengthErr(route), newFallbackState())).toBe(true);
+      expect(cooldownFor(route)).toBeUndefined();
+    }
+    // Streak limit reached: the exemption lifts and the normal path runs.
+    expect(recordRetryableFailure(route, emptyLengthErr(route), newFallbackState())).toBe(false);
+    expect(cooldownFor(route)).toBeDefined();
+    expect(getAllPenalties().some(p => p.modelDbId === route.modelDbId)).toBe(true);
+  });
+
+  it('a success on the model+key resets the streak', () => {
+    const route = fakeRoute();
+    for (let i = 1; i < EMPTY_COMPLETION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, emptyLengthErr(route), newFallbackState());
+    }
+    recordUpstreamSuccess(route, 0);
+    // The full pre-limit run is available again.
+    for (let i = 1; i < EMPTY_COMPLETION_STREAK_LIMIT; i++) {
+      expect(recordRetryableFailure(route, emptyLengthErr(route), newFallbackState())).toBe(true);
+    }
+    expect(cooldownFor(route)).toBeUndefined();
+  });
+
+  it('a normally-penalized failure resets the streak too', () => {
+    const route = fakeRoute();
+    for (let i = 1; i < EMPTY_COMPLETION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, emptyLengthErr(route), newFallbackState());
+    }
+    // A plain 429 takes the cooldown ladder — and breaks the streak.
+    recordRetryableFailure(route, Object.assign(new Error('429 Too Many Requests'), { status: 429 }), newFallbackState());
+    getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+    for (let i = 1; i < EMPTY_COMPLETION_STREAK_LIMIT; i++) {
+      expect(recordRetryableFailure(route, emptyLengthErr(route), newFallbackState())).toBe(true);
+    }
+    expect(cooldownFor(route)).toBeUndefined();
+  });
+
+  it('format violations (skipModelForRequest) stay exempt and never accrue', () => {
+    const route = fakeRoute();
+    const formatErr = () => Object.assign(
+      new Error(`${route.displayName} ignored response_format (returned non-JSON despite json_schema)`),
+      { skipBench: true, skipModelForRequest: true },
+    );
+    for (let i = 0; i < EMPTY_COMPLETION_STREAK_LIMIT * 2; i++) {
+      expect(recordRetryableFailure(route, formatErr(), newFallbackState())).toBe(true);
+    }
+    // …and they did not pre-charge the empty-completion streak either.
+    expect(recordRetryableFailure(route, emptyLengthErr(route), newFallbackState())).toBe(true);
+    expect(cooldownFor(route)).toBeUndefined();
+  });
+
+  it('an over-the-limit empty completion counts toward the breaker', async () => {
+    const route = fakeRoute();
+    const onExhausted = vi.fn();
+    const dispatch = vi.fn(async () => { throw emptyLengthErr(route); });
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, breakerLimit: 2, route: () => route, dispatch, onExhausted }));
+
+    // The first LIMIT-1 failures are exempt (invisible to the breaker); the
+    // next two count and trip the 2-limit breaker.
+    expect(dispatch).toHaveBeenCalledTimes(EMPTY_COMPLETION_STREAK_LIMIT - 1 + 2);
+    expect(onExhausted).toHaveBeenCalledTimes(1);
+    expect(onExhausted.mock.calls[0][0].status).toBe(503);
+  });
+});
+
+describe('truncated-stream streak benches a sick route (#1218)', () => {
+  const truncErr = (name: string) =>
+    new Error(`${name} stream ended unexpectedly (no [DONE], no finish_reason) — connection reset or truncated upstream`);
+  const cooldownExpiry = (route: RouteResult): number | undefined => {
+    const row = getDb().prepare(
+      'SELECT expires_at_ms FROM rate_limit_cooldowns WHERE platform = ? AND key_id = ?',
+    ).get('fake', route.keyId) as { expires_at_ms: number } | undefined;
+    return row?.expires_at_ms;
+  };
+
+  it('a single truncation keeps the ordinary short transient bench', () => {
+    const route = fakeRoute();
+    recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    // The retryable ladder already benches briefly; the streak adds nothing yet.
+    const expiry = cooldownExpiry(route);
+    expect(expiry).toBeDefined();
+    expect(expiry! - Date.now()).toBeLessThan(TRUNCATION_BENCH_MS);
+  });
+
+  it(`extends the bench to TRUNCATION_BENCH_MS from the Nth consecutive truncation on the same model+key`, () => {
+    const route = fakeRoute();
+    for (let i = 1; i < TRUNCATION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+      expect(cooldownExpiry(route)! - Date.now()).toBeLessThan(TRUNCATION_BENCH_MS);
+    }
+    // Streak limit reached: the bench is now the full truncation window.
+    recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    expect(cooldownExpiry(route)! - Date.now()).toBeGreaterThanOrEqual(TRUNCATION_BENCH_MS - 1000);
+  });
+
+  it('a success on the route resets the streak', () => {
+    const route = fakeRoute();
+    for (let i = 1; i < TRUNCATION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    }
+    recordUpstreamSuccess(route, 0);
+    getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+    for (let i = 1; i < TRUNCATION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    }
+    expect(cooldownExpiry(route)! - Date.now()).toBeLessThan(TRUNCATION_BENCH_MS);
+  });
+
+  it('a differently-classified failure on the route breaks the streak', () => {
+    const route = fakeRoute();
+    for (let i = 1; i < TRUNCATION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    }
+    // A 429 takes the cooldown ladder — and breaks the truncation streak.
+    recordRetryableFailure(route, Object.assign(new Error('429 Too Many Requests'), { status: 429 }), newFallbackState());
+    getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+    for (let i = 1; i < TRUNCATION_STREAK_LIMIT; i++) {
+      recordRetryableFailure(route, truncErr(route.displayName), newFallbackState());
+    }
+    expect(cooldownExpiry(route)! - Date.now()).toBeLessThan(TRUNCATION_BENCH_MS);
+  });
 });
 
 describe('exhaustedRetryError attempt trail + auth exhaustion', () => {
@@ -251,7 +426,7 @@ describe('runFallbackLoop: auth rotation (401 is key-fatal, not request-fatal)',
 });
 
 describe('runFallbackLoop: wall-clock retry budget', () => {
-  it('stops starting new attempts once the budget is spent and reports timedOut', async () => {
+  it('always allows one failover hop, then stops and reports timedOut (#751)', async () => {
     const dispatch = vi.fn(async () => {
       await new Promise(r => setTimeout(r, 25));
       throw Object.assign(new Error('429 Too Many Requests'), { status: 429 });
@@ -264,12 +439,15 @@ describe('runFallbackLoop: wall-clock retry budget', () => {
       onExhausted,
     }));
 
-    expect(dispatch).toHaveBeenCalledTimes(1); // first attempt always runs, no second start
+    // Attempt 0 alone consumed the budget, but attempt 1 still starts — a
+    // slow-failing model must never make failover structurally impossible.
+    // Attempt 2 is where the spent budget stops the chain.
+    expect(dispatch).toHaveBeenCalledTimes(2);
     expect(onExhausted).toHaveBeenCalledTimes(1);
     const [body, info] = onExhausted.mock.calls[0];
     expect(info.timedOut).toBe(true);
     expect(body.message).toContain('retry time budget');
-    expect(info.attempts).toHaveLength(1);
+    expect(info.attempts).toHaveLength(2);
   });
 
   it('budget 0 disables the check', async () => {
@@ -399,6 +577,42 @@ describe('runFallbackLoop: circuit-breaker guardrail (max_consecutive_upstream_f
     expect(info.attempts).toHaveLength(2);
   });
 
+  it('skipBench failures (format ignored, hidden reasoning) never trip the breaker', async () => {
+    // Three prose answers to a json_schema request say nothing about pool
+    // health — candidate four must still get its shot. (#511 x #516)
+    const onExhausted = vi.fn();
+    let calls = 0;
+    const dispatch = vi.fn(async () => {
+      calls += 1;
+      if (calls <= 3) {
+        throw Object.assign(
+          new Error(`Fake ${calls} ignored response_format (returned non-JSON despite json_schema)`),
+          { skipBench: true },
+        );
+      }
+      return 'done' as const;
+    });
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, breakerLimit: 3, dispatch, onExhausted }));
+
+    expect(dispatch).toHaveBeenCalledTimes(4); // 3 skipBench failures did not trip the 3-limit breaker
+    expect(onExhausted).not.toHaveBeenCalled();
+  });
+
+  it('a breaker trip after client disconnect stops the chain without rendering', async () => {
+    const onExhausted = vi.fn();
+    let gone = false;
+    const dispatch = vi.fn(async () => {
+      gone = true; // client hangs up during the (only) attempt
+      throw retryable429();
+    });
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, breakerLimit: 1, clientGone: () => gone, dispatch, onExhausted }));
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(onExhausted).not.toHaveBeenCalled(); // no body to a dead socket
+  });
+
   it('a success below the limit ends the request normally (breaker untouched)', async () => {
     const onExhausted = vi.fn();
     let calls = 0;
@@ -412,6 +626,155 @@ describe('runFallbackLoop: circuit-breaker guardrail (max_consecutive_upstream_f
 
     expect(dispatch).toHaveBeenCalledTimes(3);
     expect(onExhausted).not.toHaveBeenCalled();
+  });
+});
+
+describe('isProviderLevelError (#788: the PROVIDER is sick, not this key)', () => {
+  it('flags what only a sick provider produces: a 5xx, a timeout, a dead socket', () => {
+    expect(isProviderLevelError(Object.assign(new Error('Bad Gateway'), { status: 502 }))).toBe(true);
+    expect(isProviderLevelError(Object.assign(new Error('Groq API error 503: Service Unavailable'), { status: 503 }))).toBe(true);
+    expect(isProviderLevelError(Object.assign(new Error('Internal Server Error'), { status: 500 }))).toBe(true);
+    // Transport-level failures carry no HTTP status at all.
+    expect(isProviderLevelError(new Error('connect ECONNREFUSED 127.0.0.1:443'))).toBe(true);
+    expect(isProviderLevelError(new Error('read ECONNRESET'))).toBe(true);
+    expect(isProviderLevelError(new Error('fetch failed'))).toBe(true);
+    expect(isProviderLevelError(new Error('The operation was aborted (groq, chat, 120s)'))).toBe(true);
+    expect(isProviderLevelError(new Error('Fake stream stalled: no data for 90000ms (timeout)'))).toBe(true);
+    // A DEGRADED deployment is provider health wearing a 400 (#522).
+    expect(isProviderLevelError(Object.assign(new Error("Function id 'x': DEGRADED function cannot be invoked"), { status: 400 }))).toBe(true);
+  });
+
+  it('does not misfire on digits or wording that merely LOOK like a 5xx', () => {
+    // The whole point of the structured-status rule: these all carry '500'/'503'
+    // /'unavailable' in their text, and condemning the platform on any of them
+    // would strand every healthy key and model behind a sick-looking sentence.
+    expect(isProviderLevelError(Object.assign(new Error('Request took 5003ms'), { status: 400 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error("API error 400: This model's maximum context length is 8192 tokens. However, your messages resulted in 5000 tokens"), { status: 400 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('API error 429: quota of 5000 requests per day reached'), { status: 429 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('API error 403: qwen3-coder-480b is unavailable on your key\'s tier'), { status: 403 }))).toBe(false);
+  });
+
+  it('leaves key-scoped failures alone so a dead key still rotates to a sibling', () => {
+    expect(isProviderLevelError(Object.assign(new Error('Invalid API Key'), { status: 401 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('429 Too Many Requests'), { status: 429 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('Payment required'), { status: 402 }))).toBe(false);
+    // A vanished client says nothing about provider health.
+    expect(isProviderLevelError(newClientAbortError())).toBe(false);
+  });
+
+  it('never condemns a platform for MODEL behavior, however the message reads', () => {
+    // These messages quote caller- and model-supplied text: a tool called
+    // `set_timeout`, or an Ajv complaint about the instance path `/timeout`,
+    // puts a timeout marker in the sentence without a timeout having happened.
+    // `skipModelForRequest` is the structured truth and outranks the text.
+    expect(isProviderLevelError(invalidToolArgumentsError(
+      'alpha alpha-big',
+      ['set_timeout: /timeout must be number'],
+    ))).toBe(false);
+    expect(isProviderLevelError(invalidToolArgumentsError(
+      'alpha alpha-big',
+      ['run_query: /mode must be equal to one of the allowed values (degraded)'],
+    ))).toBe(false);
+    expect(isProviderLevelError(Object.assign(
+      new Error('alpha alpha-big ignored response_format (returned non-JSON despite json_object)'),
+      { skipBench: true, skipModelForRequest: true },
+    ))).toBe(false);
+  });
+});
+
+describe('runFallbackLoop: a provider-level failure skips the whole platform (#788)', () => {
+  // A miniature routeRequest: walk a fixed candidate list in order and return
+  // the first one this request has not ruled out, applying the same three gates
+  // the real router applies (skipPlatforms, skipModels, skipKeys).
+  const CANDIDATES = [
+    { platform: 'alpha', modelId: 'alpha-big', modelDbId: 788_001, keyId: 78_801 },
+    { platform: 'alpha', modelId: 'alpha-big', modelDbId: 788_001, keyId: 78_802 },
+    { platform: 'alpha', modelId: 'alpha-small', modelDbId: 788_002, keyId: 78_801 },
+    { platform: 'beta', modelId: 'beta-one', modelDbId: 788_003, keyId: 78_803 },
+  ];
+  const miniRouter = (state: FallbackState) => () => {
+    const pick = CANDIDATES.find(c =>
+      !state.skipPlatforms.has(c.platform)
+      && !state.skipModels.has(c.modelDbId)
+      && !state.skipKeys.has(`${c.platform}:${c.modelId}:${c.keyId}`));
+    if (!pick) throw Object.assign(new Error('all candidates exhausted'), { status: 429, diagnostics: [] });
+    return fakeRoute(pick);
+  };
+  const platformsTried = (dispatch: ReturnType<typeof vi.fn>): string[] =>
+    dispatch.mock.calls.map(call => (call[0] as RouteResult).platform);
+
+  it('a 503 on alpha key1 rules out alpha entirely — every key AND every model', async () => {
+    const state = newFallbackState();
+    const dispatch = vi.fn(async () => {
+      throw Object.assign(new Error('Alpha API error 503: Service Unavailable'), { status: 503 });
+    });
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    // Two hops, not four: alpha's sibling key and its second model are skipped
+    // wholesale, so failover spends its budget on the NEXT provider.
+    expect(platformsTried(dispatch)).toEqual(['alpha', 'beta']);
+    expect(state.skipPlatforms.has('alpha')).toBe(true);
+  });
+
+  it('a 401 on alpha key1 still rotates to alpha key2 (key-scoped, not provider-scoped)', async () => {
+    const state = newFallbackState();
+    const dispatch = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('Invalid API Key'), { status: 401 }))
+      .mockResolvedValueOnce('done');
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    const second = dispatch.mock.calls[1][0] as RouteResult;
+    expect(second.platform).toBe('alpha');
+    expect(second.keyId).toBe(78_802);
+    expect(state.skipPlatforms.size).toBe(0);
+  });
+
+  it('a plain 429 also stays key-scoped', async () => {
+    const state = newFallbackState();
+    const dispatch = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('429 Too Many Requests'), { status: 429 }))
+      .mockResolvedValueOnce('done');
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    expect((dispatch.mock.calls[1][0] as RouteResult).platform).toBe('alpha');
+    expect(state.skipPlatforms.size).toBe(0);
+  });
+
+  it('invalid tool arguments rule out the MODEL, never the platform', async () => {
+    // The provider served the turn perfectly; the model wrote a bad call. The
+    // sibling key would write the same one (skipModelForRequest), but alpha's
+    // OTHER model is still a fine next hop — skipping the platform here would
+    // strand it, and the tool name in the message carries a timeout marker
+    // precisely to prove the text does not drive the decision.
+    const state = newFallbackState();
+    const dispatch = vi.fn()
+      .mockRejectedValueOnce(invalidToolArgumentsError('alpha alpha-big', ['set_timeout: /timeout must be number']))
+      .mockResolvedValueOnce('done');
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    const second = dispatch.mock.calls[1][0] as RouteResult;
+    expect(second.platform).toBe('alpha');
+    expect(second.modelId).toBe('alpha-small');   // not the sibling key of alpha-big
+    expect(state.skipPlatforms.size).toBe(0);
+    expect(state.skipModels.has(788_001)).toBe(true);
+  });
+
+  it('a timeout with no HTTP status rules the platform out too', async () => {
+    const state = newFallbackState();
+    const dispatch = vi.fn()
+      .mockRejectedValueOnce(new Error('The operation was aborted (alpha, chat, 120s)'))
+      .mockResolvedValueOnce('done');
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    expect((dispatch.mock.calls[1][0] as RouteResult).platform).toBe('beta');
+    expect(state.skipPlatforms.has('alpha')).toBe(true);
   });
 });
 
@@ -455,5 +818,88 @@ describe('runFallbackLoop: client disconnect + attempt log', () => {
 
     expect(attemptLog).toHaveLength(2); // the two failures, not the success
     expect(attemptLog[0].errorClass).toBe('rate_limited');
+  });
+});
+
+// The diagnostics line used to live in each surface's onRoutingExhausted hook,
+// and only routes/proxy.ts ever implemented it — so an opaque routing_error on
+// /v1/messages, /v1/responses or an inbound wire recorded nothing about WHY the
+// pool was empty. It belongs to the loop: these tests pin it there, for every
+// surface, including one that supplies no identity at all.
+describe('runFallbackLoop: routing-exhaustion diagnostics belong to the loop', () => {
+  const routeError = (diagnostics: string[]) =>
+    Object.assign(new Error('all candidates exhausted'), { status: 429, diagnostics });
+
+  const warnedLine = (warn: ReturnType<typeof vi.spyOn>): string | undefined =>
+    warn.mock.calls.map(c => String(c[0])).find(l => l.includes('routing exhausted'));
+
+  it('logs the router per-candidate disposition when no upstream was tried', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await runFallbackLoop(hooksSkeleton({
+        logIdentity: { surface: 'anthropic messages', requestId: 'abcdef12-3456-7890', requestedModel: 'claude-x' },
+        route: () => { throw routeError(['glm-4.7 @zai: cooldown 42s', 'llama @groq: rpd 0 left']); },
+      }));
+      const line = warnedLine(warn);
+      expect(line).toBeDefined();
+      expect(line).toContain('anthropic messages');
+      expect(line).toContain('req=abcdef');           // hyphens stripped, 6 chars
+      expect(line).toContain('requested=claude-x');
+      expect(line).toContain('candidates=2');
+      expect(line).toContain('glm-4.7 @zai: cooldown 42s');
+      expect(line).toContain('llama @groq: rpd 0 left');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('still fires for a surface that supplies no logIdentity', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await runFallbackLoop(hooksSkeleton({
+        route: () => { throw routeError(['solo @fake: no usable key']); },
+      }));
+      const line = warnedLine(warn);
+      expect(line).toBeDefined();
+      expect(line).toContain('unidentified surface');
+      expect(line).toContain('candidates=1');
+      expect(line).toContain('solo @fake: no usable key');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('handles a RouteError carrying no diagnostics at all', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await runFallbackLoop(hooksSkeleton({
+        logIdentity: { surface: 'inbound chat' },
+        route: () => { throw Object.assign(new Error('nothing routable'), { status: 429 }); },
+      }));
+      const line = warnedLine(warn);
+      expect(line).toBeDefined();
+      expect(line).toContain('inbound chat');
+      expect(line).toContain('candidates=0');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('stays silent when attempts already ran — the attempt trail explains those', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      let call = 0;
+      await runFallbackLoop(hooksSkeleton({
+        logIdentity: { surface: 'chat completions' },
+        route: () => {
+          if (call++ === 0) return fakeRoute();
+          throw routeError(['everything @fake: cooldown']);
+        },
+        dispatch: async () => { throw Object.assign(new Error('Too Many Requests'), { status: 429 }); },
+      }));
+      expect(warnedLine(warn)).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

@@ -4,8 +4,8 @@ import type {
   ChatCompletionChunk,
   ChatToolDefinition,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { flattenMessageContent } from '../lib/content.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { stripSchemaKeys } from '../lib/tool-args.js';
@@ -44,7 +44,7 @@ export class CohereProvider extends BaseProvider {
       model: modelId,
       messages: flattenMessageContent(messages),
       temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
+      max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
       top_p: options?.top_p,
       stop: options?.stop,
       tools: sanitizeCohereTools(options?.tools),
@@ -59,7 +59,9 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, undefined, { signal: options?.signal, timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -71,7 +73,7 @@ export class CohereProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cohere API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cohere API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
     }
 
     const data = await res.json() as ChatCompletionResponse;
@@ -90,7 +92,7 @@ export class CohereProvider extends BaseProvider {
       model: modelId,
       messages: flattenMessageContent(messages),
       temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
+      max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
       top_p: options?.top_p,
       stop: options?.stop,
       tools: sanitizeCohereTools(options?.tools),
@@ -106,7 +108,9 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, undefined, { signal: options?.signal });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -118,19 +122,19 @@ export class CohereProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cohere API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cohere API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
     }
 
     yield* this.readSseStream(res);
   }
 
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable. Only confirmed 401/403 disables a key.
     const res = await this.fetchWithTimeout(`${API_BASE}/models`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${apiKey}` },
-    }, 10000);
+    }, 10000, { timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -139,6 +143,6 @@ export class CohereProvider extends BaseProvider {
       quotaPoolKey: quotaContext?.quotaPoolKey,
       endpoint: 'models',
     });
-    return res.status !== 401 && res.status !== 403;
+    return this.validationResult(res);
   }
 }

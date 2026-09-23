@@ -10,7 +10,6 @@ export interface Db {
   // Mirrors better-sqlite3's pattern: transaction() wraps fn and returns a
   // callable with the same signature. The F extends constraint covers both
   // zero-arg transactions and the parameterised form used in routes/embeddings.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   transaction<F extends (...args: any[]) => unknown>(fn: F): F;
   pragma(source: string): unknown;
   // Optional file metadata, populated when the backing store is better-sqlite3
@@ -19,6 +18,8 @@ export interface Db {
   // as "no file backing" and fall back accordingly.
   readonly name?: string;
   readonly memory?: boolean;
+  /** Close the backing connection when the driver exposes that operation. */
+  close?(): void;
 }
 
 /** Factory that opens (or creates) a database at the given resolved path and

@@ -5,11 +5,59 @@ import type {
   ChatToolCall,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
+import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { isAbortLikeError } from '../lib/error-classify.js';
+import { contentToString } from '../lib/content.js';
+
+/** Hosts that ARE Moonshot's OpenAI-compatible API (api.moonshot.ai,
+ * api.moonshot.cn, api.kimi.com and their subdomains). */
+const MOONSHOT_HOST_SUFFIXES = ['moonshot.ai', 'moonshot.cn', 'kimi.com'];
+
+/**
+ * Whether a base URL points at Moonshot's own API. Moonshot documents an
+ * assistant-message `partial: true` prefill flag that no other OpenAI-compatible
+ * upstream understands, and there is no built-in moonshot platform — Kimi
+ * models are otherwise served by Groq, Cloudflare, OpenRouter, Hugging Face,
+ * Ollama, ... — so the flag is gated on the endpoint host, never on the model
+ * id. Returns false for anything that does not parse as a URL. (#1038)
+ */
+export function isMoonshotEndpoint(baseUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return MOONSHOT_HOST_SUFFIXES.some((d) => host === d || host.endsWith(`.${d}`));
+}
+
+/**
+ * Some free-tier upstreams (notably Pollinations) answer HTTP 200 but put an
+ * out-of-credits / top-up notice in the assistant message instead of returning
+ * a 402. That reads as a successful completion, so the fallback loop never
+ * rotates off the dead key (#pollinations-inband). Detect the notice so callers
+ * can throw a payment-required error and fail over. Kept deliberately tight —
+ * requires the credits phrase AND a top-up/quest/Pollinations marker — so a
+ * genuine reply that merely discusses credits does not trip it.
+ */
+export function inBandCreditsError(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  const mentionsCredits = t.includes('enough credits') || t.includes('insufficient credit');
+  if (!mentionsCredits) return null;
+  const topUpMarker =
+    t.includes('top up') || t.includes('top-up') ||
+    t.includes('complete a quest') || t.includes('pollinations');
+  if (!topUpMarker) return null;
+  return text.trim().slice(0, 200);
+}
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -22,13 +70,17 @@ export class OpenAICompatProvider extends BaseProvider {
   private readonly baseUrl: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
-  /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted
-   * inference (llama.cpp / vLLM on CPU) can take 30-120s for long prompts. Default 15000. */
+  /** Per-provider HTTP timeout override. OpenAI-compatible gateways often buffer
+   * non-streaming responses until generation completes, and reasoning models can
+   * take >15s before first byte. Default 60000. */
   private readonly timeoutMs: number;
   /** NVIDIA NIM models reject any request that permits parallel tool calls with
    * `400 This model only supports single tool-calls at once!`. When set, pin
    * parallel_tool_calls to false whenever tools are in play. See issue #255. */
   private readonly forceSingleToolCall: boolean;
+  /** True only for a custom endpoint whose host is Moonshot's own API; see
+   * isMoonshotEndpoint(). Gates the assistant `partial` prefill flag (#1038). */
+  private readonly forwardsPartial: boolean;
 
   constructor(opts: {
     platform: Platform;
@@ -46,9 +98,11 @@ export class OpenAICompatProvider extends BaseProvider {
     this.baseUrl = opts.baseUrl;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.validateUrl = opts.validateUrl;
-    this.timeoutMs = opts.timeoutMs ?? 15000;
+    // PROVIDER_TIMEOUT_<PLATFORM> wins over the registration default (#547).
+    this.timeoutMs = providerTimeoutMs(opts.platform, opts.timeoutMs ?? 60_000);
     this.keyless = opts.keyless ?? false;
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
+    this.forwardsPartial = opts.platform === 'custom' && isMoonshotEndpoint(opts.baseUrl);
   }
 
   /** Resolve the parallel_tool_calls flag to send upstream. For providers that
@@ -78,11 +132,34 @@ export class OpenAICompatProvider extends BaseProvider {
     const rescue = rescueInlineToolCalls(failed, toolNames);
     if (!rescue.detected || !rescue.calls?.length) return null;
     const schemas = toolSchemaMap(options?.tools);
-    return rescue.calls.map((c, i) => ({
+    const rescued = rescue.calls.map((c, i) => ({
       id: `call_rescued_${i + 1}`,
       type: 'function' as const,
       function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name)) },
     }));
+    // Opt-in schema verdict. A rescue that produces schema-invalid arguments
+    // has turned the provider's 400 into a "success" the client cannot use, so
+    // decline it instead: the original upstream error propagates and the loop
+    // fails over exactly as it did before the rescue existed. Declining is the
+    // right shape here rather than throwing our own error — we are inside the
+    // provider's error path already.
+    if (isToolArgumentValidationEnabled() && invalidToolCallReasons(rescued, schemas).length > 0) {
+      return null;
+    }
+    return rescued;
+  }
+
+  /** Extract the useful text from an upstream error body. Most providers put it
+   * at error.message, but NVIDIA NIM answers RFC7807-style ({"title": ...,
+   * "detail": "Function id '...': DEGRADED function cannot be invoked"}) — the
+   * old error.message-only read collapsed that to "Bad Request", so neither the
+   * logs nor the error classifier could ever see the DEGRADED marker (#522). */
+  private upstreamErrorText(errBody: unknown, res: Response): string {
+    const e = errBody as { error?: { message?: unknown }; detail?: unknown; title?: unknown };
+    if (typeof e?.error?.message === 'string' && e.error.message) return e.error.message;
+    if (typeof e?.detail === 'string' && e.detail) return e.detail;
+    if (typeof e?.title === 'string' && e.title) return e.title;
+    return res.statusText;
   }
 
   /** Keyless providers (Kilo's anonymous free tier) must send NO Authorization
@@ -92,6 +169,102 @@ export class OpenAICompatProvider extends BaseProvider {
     return this.keyless ? {} : { 'Authorization': `Bearer ${apiKey}` };
   }
 
+  /** Requesty's Leanstral route rejects greedy sampling when temperature=0.
+   * Omitting that value and supplying a neutral top_p keeps the caller's intent
+   * deterministic enough while using the provider's supported sampling path. */
+  protected samplingForModel(modelId: string, options?: CompletionOptions): {
+    temperature: number | undefined;
+    topP: number | undefined;
+  } {
+    if (
+      this.platform === 'requesty' &&
+      modelId === 'mistral/leanstral-1-5' &&
+      options?.temperature === 0
+    ) {
+      return { temperature: undefined, topP: options.top_p ?? 1 };
+    }
+    return { temperature: options?.temperature, topP: options?.top_p };
+  }
+
+  /**
+   * OpenAI-compatible endpoints that are strict about unknown nested fields:
+   * Mistral returns 422 for provider-private replay fields, Groq rejects
+   * assistant `reasoning_content` with 400 (verified in production, #1070),
+   * and Cerebras rejects it too — `property 'messages.N.assistant.
+   * reasoning_content' is unsupported` (confirmed via vercel/ai#15042 and
+   * opencode#26762, and by Cerebras' own docs, which use a `reasoning` field
+   * instead). Other gateways ignore the fields, so keep the OpenAI wire
+   * shape but strip our internal reasoning / thought-signature extensions
+   * before sending to these platforms.
+   */
+  private static readonly STRICT_PLATFORMS = new Set(['mistral', 'groq', 'cerebras']);
+  private messagesForPlatform(messages: ChatMessage[], modelId: string): ChatMessage[] {
+    if (OpenAICompatProvider.STRICT_PLATFORMS.has(this.platform)) {
+      // Rebuild every message from a whitelist of keys, so `partial` and the
+      // reasoning extensions never reach these platforms.
+      return messages.map((m) => {
+        if (m.role === 'assistant') {
+          return {
+            role: m.role,
+            content: m.content,
+            ...(m.name ? { name: m.name } : {}),
+            ...(m.tool_calls && m.tool_calls.length > 0 ? {
+              tool_calls: m.tool_calls.map((tc) => ({
+                id: tc.id,
+                type: tc.type,
+                function: {
+                  name: tc.function.name,
+                  arguments: tc.function.arguments,
+                },
+              })),
+            } : {}),
+          };
+        }
+        if (m.role === 'tool') {
+          return {
+            role: m.role,
+            content: m.content,
+            ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+            ...(m.name ? { name: m.name } : {}),
+          };
+        }
+        return {
+          role: m.role,
+          content: m.content,
+          ...(m.name ? { name: m.name } : {}),
+        };
+      });
+    }
+
+    // Moonshot's assistant `partial` prefill flag only survives to the wire
+    // when this provider IS Moonshot's own API (a custom endpoint on a
+    // Moonshot/Kimi host). Every other OpenAI-compatible gateway — including
+    // the ones that serve Kimi models, like Groq, Cloudflare or OpenRouter —
+    // gets it stripped, since strict upstreams 400/422 on unknown message keys
+    // and the rest would ignore it anyway. (#1038)
+    const sanitized = this.forwardsPartial ? messages : messages.map((m) => {
+      if (m.role === 'assistant' && m.partial !== undefined) {
+        const { partial: _partial, ...rest } = m;
+        return rest;
+      }
+      return m;
+    });
+
+    // Qwen3.8-Flash-Next accepts exactly one system message, and only at index
+    // zero. Profiles can prepend a gateway system prompt to a client's own
+    // system message, so coalesce every system instruction before dispatch
+    // instead of letting an otherwise valid request fail upstream.
+    if (this.platform === 'radeon' && modelId === 'Qwen3.8-Flash-Next') {
+      const systems = sanitized.filter(m => m.role === 'system');
+      if (systems.length === 1 && sanitized[0]?.role === 'system') return sanitized;
+      const systemText = systems.map(m => contentToString(m.content)).filter(Boolean).join('\n\n');
+      const rest = sanitized.filter(m => m.role !== 'system');
+      return systemText ? [{ role: 'system', content: systemText }, ...rest] : rest;
+    }
+
+    return sanitized;
+  }
+
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -99,6 +272,7 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
+    const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -108,17 +282,19 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
+        messages: this.messagesForPlatform(messages, modelId),
+        temperature: sampling.temperature,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
       }),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -145,7 +321,7 @@ export class OpenAICompatProvider extends BaseProvider {
         out._routed_via = { platform: this.platform, model: modelId };
         return out;
       }
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
     }
 
     let data: ChatCompletionResponse;
@@ -153,6 +329,10 @@ export class OpenAICompatProvider extends BaseProvider {
     try {
       data = await res.json() as ChatCompletionResponse;
     } catch (err) {
+      // An aborted body read (per-attempt deadline, client disconnect) is not
+      // a malformed body — rethrow so it keeps its abort classification
+      // instead of reading as a "non-OpenAI-compatible endpoint" below.
+      if (isAbortLikeError(err)) throw err;
       parseErr = err;
       data = undefined as unknown as ChatCompletionResponse;
     }
@@ -200,6 +380,16 @@ export class OpenAICompatProvider extends BaseProvider {
       );
     }
     normalizeChoices(data);
+    // #pollinations-inband: a 200 whose body is really an out-of-credits notice
+    // must fail over, not be returned as the answer. The "402 ... insufficient
+    // credit" wording makes isPaymentRequiredError classify it as retryable and
+    // bench the key with the day-long payment-required cooldown.
+    const creditsNotice = inBandCreditsError(
+      (data.choices ?? []).map(c => contentToString((c.message as ChatMessage)?.content)).join('\n'),
+    );
+    if (creditsNotice) {
+      throw new Error(`${this.name} API error 402: insufficient credit (upstream returned 200 with an out-of-credits notice): ${creditsNotice}`);
+    }
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
   }
@@ -211,6 +401,7 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
+    const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -220,18 +411,21 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
+        messages: this.messagesForPlatform(messages, modelId),
+        temperature: sampling.temperature,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
         stream: true,
+        stream_options: options?.stream_options,
       }),
-    }, this.timeoutMs);
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -253,37 +447,101 @@ export class OpenAICompatProvider extends BaseProvider {
         yield { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] };
         return;
       }
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
     }
 
-    yield* this.readSseStream(res);
+    // First-byte grace (#584): the same chat timeout that bounded the headers
+    // also budgets the first stream read — NIM-style providers send SSE
+    // headers instantly, then prefill long prompts for minutes.
+    yield* this.guardInBandCreditsError(
+      this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs }),
+    );
   }
 
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
-    // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
-    // health.ts catches them and marks status='error' WITHOUT incrementing
-    // the consecutive-failure counter — only confirmed 401/403 disables a key.
-    const url = this.validateUrl ?? `${this.baseUrl}/models`;
+  /**
+   * #pollinations-inband: wrap a chat stream so an in-band out-of-credits notice
+   * (a 200 that streams the top-up message as content) fails over instead of
+   * being shown as the answer. Only the FIRST content-bearing chunk is inspected
+   * — a Pollinations credits notice arrives as a single canned message — so the
+   * stream is otherwise byte-for-byte unchanged: reasoning/role chunks pass
+   * straight through (first-token ttfb intact) and every chunk after the first
+   * content one is untouched. Throwing on that first content chunk happens before
+   * it reaches the proxy's commit point, so the fallback loop can still rotate.
+   */
+  private async *guardInBandCreditsError(
+    src: AsyncGenerator<ChatCompletionChunk>,
+  ): AsyncGenerator<ChatCompletionChunk> {
+    let sawContent = false;
+    for await (const chunk of src) {
+      if (!sawContent) {
+        const content = (chunk.choices ?? [])
+          .map(c => (c.delta as { content?: unknown } | undefined)?.content)
+          .filter((c): c is string => typeof c === 'string')
+          .join('');
+        if (content) {
+          sawContent = true;
+          const notice = inBandCreditsError(content);
+          if (notice) {
+            throw new Error(`${this.name} API error 402: insufficient credit (upstream streamed an out-of-credits notice): ${notice}`);
+          }
+        }
+      }
+      yield chunk;
+    }
+  }
+
+  /** This provider's OpenAI-style model catalog URL. */
+  get modelsUrl(): string {
+    return `${this.baseUrl}/models`;
+  }
+
+  /**
+   * GET a catalog-style endpoint with this provider's auth header, extra
+   * headers, proxy routing, timeout policy and quota bookkeeping. Shared by
+   * validateKey (which only reads the status) and custom-endpoint model
+   * discovery (#488), which also reads the body — one place owns how we talk
+   * to a provider's /models route.
+   *
+   * Note: transport errors (DNS / timeout / TLS) propagate to the caller.
+   * health.ts catches them and marks status='error' WITHOUT incrementing the
+   * consecutive-failure counter — only confirmed 401/403 disables a key.
+   */
+  protected fetchCatalogEndpoint(url: string, apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
     // 30s (not 10s): some upstreams return a large /v1/models catalog that
     // takes >10s from high-latency regions (e.g. NVIDIA NIM measured ~11.2s
     // from India). A 10s cap aborted those calls and health.ts marked a
     // perfectly good key status='error'. 30s aligns with chatCompletion's
     // own slow-upstream allowance and costs nothing for fast providers.
-    const res = await this.fetchWithTimeout(url, {
+    return this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
         ...this.authHeader(apiKey),
         ...this.extraHeaders,
       },
-    }, 30000);
-    recordQuotaObservationsFromResponse(res, {
-      platform: this.platform,
-      keyId: quotaContext?.keyId,
-      providerAccountId: quotaContext?.providerAccountId,
-      quotaPoolKey: quotaContext?.quotaPoolKey,
-      endpoint: 'models',
+      // 'request' bounds: a catalog body that hangs mid-transfer must not
+      // stall the health cycle past the deadline.
+    }, 30000, { timeoutBounds: 'request' }).then(res => {
+      recordQuotaObservationsFromResponse(res, {
+        platform: this.platform,
+        keyId: quotaContext?.keyId,
+        providerAccountId: quotaContext?.providerAccountId,
+        quotaPoolKey: quotaContext?.quotaPoolKey,
+        endpoint: 'models',
+      });
+      return res;
     });
-    return res.status !== 401 && res.status !== 403;
+  }
+
+  /** The raw `${baseUrl}/models` response, body unread. Used by custom-endpoint
+   *  model discovery (#488); unlike validateKey it always hits /models, never a
+   *  provider-specific validateUrl, because the caller wants the catalog. */
+  fetchModelCatalog(apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
+    return this.fetchCatalogEndpoint(this.modelsUrl, apiKey, quotaContext);
+  }
+
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
+    const res = await this.fetchCatalogEndpoint(this.validateUrl ?? this.modelsUrl, apiKey, quotaContext);
+    return this.validationResult(res);
   }
 }
 
@@ -309,6 +567,12 @@ function normalizeChoices(data: ChatCompletionResponse): void {
         .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
         .join('');
     }
+    // Inline `<think>…</think>` extraction (DeepSeek-style) BEFORE the fold
+    // below: a leading think block moves out of content into
+    // reasoning_content. Runs before the fold so a think-only message (no
+    // answer after the block) still folds back into content and is never
+    // returned as an empty assistant message.
+    extractThinkFromMessage(msg);
     // Fold reasoning into content if content is empty AND there are no
     // tool_calls. With tool_calls present, content=null is the correct OpenAI
     // shape; folding reasoning would confuse clients that branch on content.

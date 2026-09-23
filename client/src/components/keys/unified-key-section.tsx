@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
+import { toast } from '@/lib/toast'
 import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 
@@ -26,8 +28,11 @@ export function UnifiedKeySection() {
     ? `http://${window.location.hostname}:${__SERVER_PORT__}/v1`
     : `${window.location.origin}/v1`
 
-  function copy() {
-    navigator.clipboard.writeText(apiKey)
+  async function copy() {
+    if (!await copyText(apiKey)) {
+      toast.error(t('common.copyFailed'))
+      return
+    }
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -63,7 +68,7 @@ export function UnifiedKeySection() {
           <Button variant="outline" size="sm" onClick={() => setShowKey(!showKey)}>
             {showKey ? t('keys.hideKey') : t('keys.showKey')}
           </Button>
-          <Button variant="outline" size="sm" onClick={copy}>
+          <Button variant="outline" size="sm" onClick={() => void copy()}>
             {copied ? t('keys.copiedKey') : t('keys.copyKey')}
           </Button>
         </div>
@@ -81,6 +86,27 @@ export function UnifiedKeySection() {
         <span className="text-muted-foreground">{t('keys.endpointEmbeddings')}</span>
         <code className="font-mono">/v1/embeddings <span className="text-muted-foreground">({t('keys.endpointEmbeddingsHint')})</span></code>
       </div>
+
+      <details className="group mt-4 rounded-xl border bg-muted/40 p-3">
+        <summary className="cursor-pointer select-none text-xs font-medium">{t('keys.quickStart')}</summary>
+        <p className="mt-2 text-xs text-muted-foreground">{t('keys.quickStartDesc')}</p>
+        <div className="mt-3 space-y-3">
+          <div>
+            <div className="mb-1 text-[11px] font-medium text-muted-foreground">{t('keys.exampleAuto')}</div>
+            <pre className="overflow-x-auto rounded-lg bg-background p-3 font-mono text-[11px] leading-relaxed"><code>{`curl ${baseUrl}/chat/completions \\
+  -H "Authorization: Bearer $YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'`}</code></pre>
+          </div>
+          <div>
+            <div className="mb-1 text-[11px] font-medium text-muted-foreground">{t('keys.exampleFast')}</div>
+            <pre className="overflow-x-auto rounded-lg bg-background p-3 font-mono text-[11px] leading-relaxed"><code>{`curl ${baseUrl}/chat/completions \\
+  -H "Authorization: Bearer $YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"auto:fast","messages":[{"role":"user","content":"Hello"}]}'`}</code></pre>
+          </div>
+        </div>
+      </details>
     </section>
   )
 }

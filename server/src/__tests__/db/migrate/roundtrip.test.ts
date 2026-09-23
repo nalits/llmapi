@@ -11,7 +11,36 @@ const REQUEST_AGGREGATES_FILENAME = '20260628_120000_request_aggregates.ts';
 const GITHUB_GPT41_CONTEXT_FILENAME = '20260630_000001_github_gpt41_context.ts';
 const REQUEST_CLIENT_INFO_FILENAME = '20260706_000001_request_client_info.ts';
 const CUSTOM_MODEL_TOOL_SUPPORT_FILENAME = '20260706_000002_custom_model_tool_support.ts';
-const MULTI_USER_ISOLATION_FILENAME = '20260711_000001_multi_user_isolation.ts';
+const PROFILE_CHAIN_BACKFILL_FILENAME = '20260714_000001_profile_chain_backfill.ts';
+const KEY_HEALTH_ERROR_FILENAME = '20260720_000001_key_health_error.ts';
+const COOLDOWN_PROBE_PROVENANCE_FILENAME = '20260726_000001_cooldown_probe_provenance.ts';
+const REQUEST_ATTEMPTS_FILENAME = '20260726_000002_request_attempts.ts';
+const MODEL_SOURCE_PROVENANCE_FILENAME = '20260726_000003_model_source_provenance.ts';
+const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
+const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
+const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
+const AGENT_COMPATIBILITY_FILENAME = '20260727_000001_agent_compatibility.ts';
+const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
+const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
+const CUSTOM_ENDPOINT_HOST_LABELS_FILENAME = '20260802_000001_custom_endpoint_host_labels.ts';
+const KEY_MODEL_SCOPE_FILENAME = '20260805_000001_key_model_scope.ts';
+const CLIENT_PROFILES_FILENAME = '20260805_000002_client_profiles.ts';
+const API_KEY_PROXY_FILENAME = '20260810_000001_api_key_proxy.ts';
+const PLAYGROUND_CONVERSATIONS_FILENAME = '20260820_000001_playground_conversations.ts';
+const CUSTOM_MODEL_TOMBSTONES_FILENAME = '20260819_000001_custom_model_tombstones.ts';
+const SERVER_LOGS_FILENAME = '20260823_000001_server_logs.ts';
+const BACKUPS_TABLE_FILENAME = '20260823_000002_backups_table.ts';
+const ATTEMPT_KEY_LABEL_FILENAME = '20260823_000003_attempt_key_label.ts';
+const PROFILE_AUTO_INCLUDE_FILENAME = '20260823_000004_profile_auto_include.ts';
+const IDEMPOTENCY_CLAIMS_FILENAME = '20260901_000001_idempotency_claims.ts';
+const QUOTA_OBSERVATION_LOOKUP_FILENAME = '20260901_000002_quota_observation_lookup.ts';
+const REQUEST_CALLER_FILENAME = '20260901_000003_request_caller.ts';
+const ANALYTICS_LATENCY_PERCENTILE_INDEX_FILENAME = '20260902_000001_analytics_latency_percentile_index.ts';
+const MCP_ENABLED_DEFAULT_FILENAME = '20260903_000001_mcp_enabled_default.ts';
+const RESPONSE_CACHE_FILENAME = '20260903_000002_response_cache.ts';
+const KEY_MONTHLY_BUDGET_FILENAME = '20260904_000001_key_monthly_budget.ts';
+const KEY_MONTHLY_USAGE_FILENAME = '20260914_000001_key_monthly_usage.ts';
+const QUOTA_SNAPSHOT_FRESHNESS_FILENAME = '20260915_000001_quota_snapshot_freshness.ts';
 
 interface SchemaRow {
   type: string;
@@ -69,7 +98,36 @@ describe('migration round trip', () => {
         GITHUB_GPT41_CONTEXT_FILENAME,
         REQUEST_CLIENT_INFO_FILENAME,
         CUSTOM_MODEL_TOOL_SUPPORT_FILENAME,
-        MULTI_USER_ISOLATION_FILENAME,
+        PROFILE_CHAIN_BACKFILL_FILENAME,
+        KEY_HEALTH_ERROR_FILENAME,
+        COOLDOWN_PROBE_PROVENANCE_FILENAME,
+        REQUEST_ATTEMPTS_FILENAME,
+        MODEL_SOURCE_PROVENANCE_FILENAME,
+        MEDIA_MODEL_META_FILENAME,
+        REQUEST_SERVED_MODEL_FILENAME,
+        ATTEMPT_ERROR_SUMMARY_FILENAME,
+        AGENT_COMPATIBILITY_FILENAME,
+        TOMBSTONE_PROVENANCE_FILENAME,
+        CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME,
+        CUSTOM_ENDPOINT_HOST_LABELS_FILENAME,
+        KEY_MODEL_SCOPE_FILENAME,
+        CLIENT_PROFILES_FILENAME,
+        API_KEY_PROXY_FILENAME,
+        CUSTOM_MODEL_TOMBSTONES_FILENAME,
+        PLAYGROUND_CONVERSATIONS_FILENAME,
+        SERVER_LOGS_FILENAME,
+        BACKUPS_TABLE_FILENAME,
+        ATTEMPT_KEY_LABEL_FILENAME,
+        PROFILE_AUTO_INCLUDE_FILENAME,
+        IDEMPOTENCY_CLAIMS_FILENAME,
+        QUOTA_OBSERVATION_LOOKUP_FILENAME,
+        REQUEST_CALLER_FILENAME,
+        ANALYTICS_LATENCY_PERCENTILE_INDEX_FILENAME,
+        MCP_ENABLED_DEFAULT_FILENAME,
+        RESPONSE_CACHE_FILENAME,
+        KEY_MONTHLY_BUDGET_FILENAME,
+        KEY_MONTHLY_USAGE_FILENAME,
+        QUOTA_SNAPSHOT_FRESHNESS_FILENAME,
       ]);
     } finally {
       db.close();
@@ -83,35 +141,38 @@ describe('migration round trip', () => {
       await runMigrations(db, 'up');
       expect(getPendingMigrationNames(db)).toEqual([]);
 
-      // multi_user_isolation is irreversible — down stops there. Verify up is
-      // idempotent by re-running migrations after a partial down through the
-      // reversible prefix only.
-      const applied = getAppliedMigrationNames(db);
-      expect(applied[applied.length - 1]).toBe(MULTI_USER_ISOLATION_FILENAME);
-
       // The catalog seed has no custom models, so the custom-model tool-support
       // backfill only alters state once a user endpoint exists. Seed one (in its
-      // post-migration state, tools = 1) so reversible downs still exercise state.
+      // post-migration state, tools = 1) so the round trip actually exercises
+      // that migration's down (tools -> 0) and up (tools -> 1).
       db.prepare(`
-        INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, supports_tools, supports_vision, enabled)
-        VALUES ('custom', 'roundtrip-custom', 'Roundtrip Custom', 50, 50, 1, 0, 1)
+        INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, supports_tools, supports_vision, enabled, source)
+        VALUES ('custom', 'roundtrip-custom', 'Roundtrip Custom', 50, 50, 1, 0, 1, 'user')
+      `).run();
+
+      // Same reasoning for the endpoint-label rename (#704): it only touches
+      // custom api_keys rows, so seed one in its post-migration state (labelled
+      // with its host) for the down (host -> 'Custom') and up to exercise.
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, base_url)
+        VALUES ('custom', '127.0.0.1:11434', 'x', 'x', 'x', 'http://127.0.0.1:11434/v1')
+      `).run();
+
+      // Same again for the /mcp lifecycle seed (#925): it reads api_keys, and
+      // with the key above present its post-migration state is enabled ('1').
+      // The first up ran against an empty api_keys and wrote '0', so pin the
+      // post-seed value here for down (row removed) and up (row rewritten) to
+      // round trip.
+      db.prepare(`
+        INSERT INTO settings (key, value) VALUES ('enable_mcp', '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run();
 
       const fullState = snapshotAppState(db);
+      await runDownToBaseline(db);
 
-      // Down through reversible migrations only (stop before irreversible multi_user).
-      while (getAppliedMigrationNames(db).length > 1) {
-        const latest = getLatestAppliedMigrationName(db);
-        if (latest === MULTI_USER_ISOLATION_FILENAME) {
-          await expect(runMigrations(db, 'down')).rejects.toThrow(/irreversible/);
-          break;
-        }
-        await runMigrations(db, 'down');
-      }
+      expect(getAppliedMigrationNames(db)).toEqual([LEGACY_BASELINE_FILENAME]);
 
-      expect(getAppliedMigrationNames(db)).toContain(MULTI_USER_ISOLATION_FILENAME);
-
-      // Re-up is a no-op while multi_user remains applied; schema stays intact.
       await runMigrations(db, 'up');
       expect(getPendingMigrationNames(db)).toEqual([]);
       expect(snapshotAppState(db)).toEqual(fullState);

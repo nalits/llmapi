@@ -5,8 +5,10 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { resolveMaxTokens } from '../lib/sampling-params.js';
 
 /**
  * AI Horde — free, community-powered inference served by volunteer workers and
@@ -41,7 +43,8 @@ import { recordQuotaObservationsFromResponse, type QuotaObservationContext } fro
 const ANON_KEY = '0000000000';
 const MIN_MAX_TOKENS = 16;
 const DEFAULT_MAX_TOKENS = 512;
-const HORDE_TIMEOUT_MS = 120000;
+// PROVIDER_TIMEOUT_AIHORDE overrides (#547).
+const HORDE_TIMEOUT_MS = providerTimeoutMs('aihorde', 120000);
 
 /** Rough token estimate (~4 chars/token) used only to fill usage when the proxy
  * returns kudos instead of token counts. Good enough for analytics, never
@@ -84,8 +87,13 @@ export class AIHordeProvider extends BaseProvider {
     const body: Record<string, unknown> = {
       model: modelId,
       messages,
-      // Floor at 16 (proxy 422s below it); default when omitted.
-      max_tokens: Math.max(MIN_MAX_TOKENS, options?.max_tokens ?? DEFAULT_MAX_TOKENS),
+      // Floor at 16 (proxy 422s below it); default when omitted. Our own
+      // default goes through resolveMaxTokens too, so the unified output cap
+      // applies to it as well — it can only ever lower what we send.
+      max_tokens: Math.max(
+        MIN_MAX_TOKENS,
+        resolveMaxTokens(this.platform, options?.max_tokens ?? DEFAULT_MAX_TOKENS) ?? DEFAULT_MAX_TOKENS,
+      ),
     };
     if (options?.temperature != null) body.temperature = options.temperature;
     if (options?.top_p != null) body.top_p = options.top_p;
@@ -137,7 +145,9 @@ export class AIHordeProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(this.buildBody(messages, modelId, options)),
-    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS);
+      // 'request' bounds: the queued generation is one blocking body read, so
+      // the deadline must cover it too (a hung body used to stall forever).
+    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -150,7 +160,7 @@ export class AIHordeProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.parseError(err, res.status, res.statusText)}`);
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.parseError(err, res.status, res.statusText)}`, err);
     }
 
     const data = await res.json() as ChatCompletionResponse;
@@ -195,11 +205,11 @@ export class AIHordeProvider extends BaseProvider {
    * confirmed 401/403 is treated as an invalid key. Transport errors propagate
    * to health.ts (marked status='error' without counting a failure).
    */
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/models`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${this.resolveBearer(apiKey)}` },
-    }, 30000);
+    }, 30000, { timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -207,6 +217,6 @@ export class AIHordeProvider extends BaseProvider {
       quotaPoolKey: quotaContext?.quotaPoolKey,
       endpoint: 'models',
     });
-    return res.status !== 401 && res.status !== 403;
+    return this.validationResult(res);
   }
 }

@@ -11,6 +11,7 @@ import { FieldError } from '@/components/ui/field-error'
 import { isHttpUrl } from '@/lib/validate'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
+import { DiscoverModelsDialog } from './discover-models-dialog'
 
 // Split a free-text model field on commas / newlines into a clean id list,
 // dropping blanks and duplicates so one endpoint can take several models. (#281)
@@ -28,7 +29,7 @@ function parseModelList(raw: string): string[] {
 export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
-  const [customType, setCustomType] = useState<'chat' | 'embedding' | 'image' | 'audio'>('chat')
+  const [customType, setCustomType] = useState<'chat' | 'embedding' | 'image' | 'audio' | 'transcription'>('chat')
   const [baseUrl, setBaseUrl] = useState('')
   const [model, setModel] = useState('')
   const [displayName, setDisplayName] = useState('')
@@ -38,6 +39,9 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
   // calls) and vision off; declare them here or flip them later per model. (#470)
   const [supportsTools, setSupportsTools] = useState(true)
   const [supportsVision, setSupportsVision] = useState(false)
+  // "Fetch models" asks the endpoint itself what it serves instead of making the
+  // user paste ids from a curl (#488).
+  const [discoverOpen, setDiscoverOpen] = useState(false)
 
   const models = customType === 'chat' ? parseModelList(model) : [model.trim()].filter(Boolean)
   const multiple = customType === 'chat' && models.length > 1
@@ -126,14 +130,18 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
       ? 'text-embedding-3-small'
       : customType === 'image'
         ? 'gpt-image-1'
-        : 'gpt-4o-mini-tts'
+        : customType === 'transcription'
+          ? 'Systran/faster-whisper-large-v3'
+          : 'gpt-4o-mini-tts'
   const addLabel = customType === 'chat'
     ? (multiple ? t('keys.addModels', { count: models.length }) : t('keys.addModel'))
     : customType === 'embedding'
       ? t('keys.addEmbeddingModel')
       : customType === 'image'
         ? t('keys.addImageModel')
-        : t('keys.addAudioModel')
+        : customType === 'transcription'
+          ? t('keys.addTranscriptionModel')
+          : t('keys.addAudioModel')
 
   const form = (
       <form onSubmit={submit} className="flex flex-wrap items-end gap-3">
@@ -144,10 +152,14 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="chat">{t('keys.customTypeChat')}</SelectItem>
-              <SelectItem value="embedding">{t('keys.customTypeEmbedding')}</SelectItem>
-              <SelectItem value="image">{t('keys.customTypeImage')}</SelectItem>
-              <SelectItem value="audio">{t('keys.customTypeAudio')}</SelectItem>
+              {/* label prop drives the trigger's SelectValue text (Base UI falls
+                  back to the raw value without it, showing "chat" instead of
+                  the translated label — #837). */}
+              <SelectItem value="chat" label={t('keys.customTypeChat')}>{t('keys.customTypeChat')}</SelectItem>
+              <SelectItem value="embedding" label={t('keys.customTypeEmbedding')}>{t('keys.customTypeEmbedding')}</SelectItem>
+              <SelectItem value="image" label={t('keys.customTypeImage')}>{t('keys.customTypeImage')}</SelectItem>
+              <SelectItem value="audio" label={t('keys.customTypeAudio')}>{t('keys.customTypeAudio')}</SelectItem>
+              <SelectItem value="transcription" label={t('keys.customTypeTranscription')}>{t('keys.customTypeTranscription')}</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -163,7 +175,19 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
           {attempted && <FieldError error={baseUrlError} />}
         </div>
         <div className="space-y-1.5">
-          <Label className="text-xs">{customType === 'chat' ? t('keys.customModels') : t('keys.customModel')}</Label>
+          <div className="flex items-center justify-between gap-2">
+            <Label className="text-xs">{customType === 'chat' ? t('keys.customModels') : t('keys.customModel')}</Label>
+            {customType === 'chat' && (
+              <button
+                type="button"
+                onClick={() => setDiscoverOpen(true)}
+                disabled={!!baseUrlError}
+                className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:pointer-events-none disabled:opacity-50"
+              >
+                {t('keys.discoverModels')}
+              </button>
+            )}
+          </div>
           <Textarea
             value={model}
             onChange={e => setModel(e.target.value)}
@@ -235,6 +259,14 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
       <p className="text-xs text-muted-foreground mb-3">{t('keys.addCustomDescription')}</p>
       {form}
       {errorLine}
+      {discoverOpen && (
+        <DiscoverModelsDialog
+          open={discoverOpen}
+          onOpenChange={setDiscoverOpen}
+          endpoint={{ baseUrl, apiKey: apiKey || undefined }}
+          onRegistered={onAdded}
+        />
+      )}
     </div>
   )
 }

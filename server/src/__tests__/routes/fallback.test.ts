@@ -10,7 +10,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -102,6 +103,35 @@ describe('Fallback API', () => {
       modelId: target.model_id,
       used: 168,
     });
+  });
+
+  // The budget bar's legend follows this payload's order. Chain priority is
+  // seeded provider by provider, so ordering by it read as "grouped by
+  // provider" on the dashboard (#1243); the legend wants smartest first.
+  it('GET /api/fallback/token-usage lists models smartest first and carries the rank', async () => {
+    const db = getDb();
+    // Two platforms with keys, several models each, in a deliberately
+    // provider-clustered chain order so the old ORDER BY priority would fail.
+    const platforms = (db.prepare(`
+      SELECT DISTINCT platform FROM models ORDER BY platform LIMIT 2
+    `).all() as { platform: string }[]).map(p => p.platform);
+    for (const platform of platforms) {
+      const secret = encrypt(`order-test-${platform}`);
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES (?, 'order', ?, ?, ?, 'healthy', 1)
+      `).run(platform, secret.encrypted, secret.iv, secret.authTag);
+    }
+
+    const { status, body } = await request(app, 'GET', '/api/fallback/token-usage');
+    expect(status).toBe(200);
+    const ranks: number[] = body.models.map((m: any) => m.intelligenceRank);
+    expect(ranks.length).toBeGreaterThan(2);
+    for (const r of ranks) expect(typeof r).toBe('number');
+    expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
+    // Not merely coincident with chain order: the models table holds more than
+    // one platform here, so a priority-ordered list would interleave differently.
+    expect(new Set(body.models.map((m: any) => m.platform)).size).toBeGreaterThan(1);
   });
 
   // Regression: GET /routing must always carry customWeights, even before the
@@ -212,6 +242,93 @@ describe('Fallback API', () => {
     await request(app, 'PUT', '/api/fallback/routing', { strategy: 'balanced' });
   });
 
+  // Regression: the toggle state must ride on GET /routing, not just the PUT
+  // echo — the dashboard checkbox renders from the GET payload, so a missing
+  // field made it look permanently off and impossible to disable from the UI.
+  it('GET /api/fallback/routing reflects the exploration toggle set via PUT', async () => {
+    const get0 = await request(app, 'GET', '/api/fallback/routing');
+    expect(get0.body.exploreEnabled).toBe(false);
+
+    const put = await request(app, 'PUT', '/api/fallback/routing', {
+      strategy: 'balanced',
+      exploreEnabled: true,
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.exploreEnabled).toBe(true);
+
+    const get1 = await request(app, 'GET', '/api/fallback/routing');
+    expect(get1.body.exploreEnabled).toBe(true);
+
+    // Restore the default so later tests start clean.
+    await request(app, 'PUT', '/api/fallback/routing', { strategy: 'balanced', exploreEnabled: false });
+    const get2 = await request(app, 'GET', '/api/fallback/routing');
+    expect(get2.body.exploreEnabled).toBe(false);
+  });
+
+  // Peak-hours adjustment (#760): opt-in, so the stock payload must report it
+  // off with the documented window, and the router must still be on the raw
+  // preset weights no matter what hour the suite runs at.
+  it('GET /api/fallback/routing reports the peak-hours settings, off by default', async () => {
+    const { body } = await request(app, 'GET', '/api/fallback/routing');
+    expect(body.peakHoursAdjust).toBe(false);
+    expect(body.peakStartHour).toBe(18);
+    expect(body.peakEndHour).toBe(6);
+    expect(body.peakTimezone).toBe('UTC');
+    expect(body.peakAdjusted).toBe(false);
+    expect(body.weights).toEqual({ reliability: 0.5, speed: 0.25, intelligence: 0.25 });
+  });
+
+  it('PUT /api/fallback/routing persists the peak-hours window and echoes the active weights', async () => {
+    const put = await request(app, 'PUT', '/api/fallback/routing', {
+      strategy: 'balanced',
+      peakHoursAdjust: true,
+      peakStartHour: 0,
+      peakEndHour: 23,
+      peakTimezone: 'Asia/Kolkata',
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.peakHoursAdjust).toBe(true);
+    expect(put.body.peakStartHour).toBe(0);
+    expect(put.body.peakEndHour).toBe(23);
+    expect(put.body.peakTimezone).toBe('Asia/Kolkata');
+    // 00:00–23:00 covers every hour but the last, so the echo is the adjusted
+    // vector except in that one hour — assert the two are consistent with each
+    // other rather than pinning the wall clock.
+    expect(put.body.weights).toEqual(put.body.peakAdjusted
+      ? { reliability: 0.65, speed: 0.1, intelligence: 0.25 }
+      : { reliability: 0.5, speed: 0.25, intelligence: 0.25 });
+    // The raw preset table is still echoed untouched for older clients.
+    expect(put.body.presets.balanced).toEqual({ reliability: 0.5, speed: 0.25, intelligence: 0.25 });
+
+    const { body } = await request(app, 'GET', '/api/fallback/routing');
+    expect(body.peakHoursAdjust).toBe(true);
+    expect(body.peakTimezone).toBe('Asia/Kolkata');
+
+    await request(app, 'PUT', '/api/fallback/routing', {
+      strategy: 'balanced', peakHoursAdjust: false, peakStartHour: 18, peakEndHour: 6, peakTimezone: 'UTC',
+    });
+  });
+
+  it('PUT /api/fallback/routing rejects invalid peak hours and timezones', async () => {
+    for (const payload of [
+      { peakStartHour: 24 },
+      { peakStartHour: -1 },
+      { peakEndHour: 24 },
+      { peakEndHour: 6.5 },
+      { peakTimezone: 'Not/AZone' },
+      { peakTimezone: '' },
+    ]) {
+      const { status } = await request(app, 'PUT', '/api/fallback/routing', { strategy: 'balanced', ...payload });
+      expect(status, JSON.stringify(payload)).toBe(400);
+    }
+    // Nothing was persisted by any of the rejected requests.
+    const { body } = await request(app, 'GET', '/api/fallback/routing');
+    expect(body.peakHoursAdjust).toBe(false);
+    expect(body.peakStartHour).toBe(18);
+    expect(body.peakEndHour).toBe(6);
+    expect(body.peakTimezone).toBe('UTC');
+  });
+
   it('PUT /api/fallback/routing rejects all-zero custom weights', async () => {
     const { status } = await request(app, 'PUT', '/api/fallback/routing', {
       strategy: 'custom',
@@ -267,6 +384,49 @@ describe('Fallback API', () => {
       if (curTier === prevTier) {
         expect(body[i].intelligenceRank).toBeGreaterThanOrEqual(body[i - 1].intelligenceRank);
       }
+    }
+  });
+
+  it('budget sort does not rank a rate-limit label above a real monthly budget', async () => {
+    // "free · 40 RPM" is a rate limit, not a 40M-token budget: the old
+    // per-route parser saw the 'M' in "RPM" and multiplied by 1e6, sorting
+    // the model to the top of the chain ahead of genuine ~25M budgets.
+    const { body: chain } = await request(app, 'GET', '/api/fallback');
+    const [rpmModel, bigModel, smallModel] = chain;
+    const db = getDb();
+    const orig = [rpmModel, bigModel, smallModel].map((m: any) =>
+      db.prepare('SELECT monthly_token_budget, tpd_limit FROM models WHERE id = ?').get(m.modelDbId) as any);
+
+    try {
+      db.prepare('UPDATE models SET tpd_limit = NULL, monthly_token_budget = ? WHERE id = ?')
+        .run('free · 40 RPM', rpmModel.modelDbId);
+      db.prepare('UPDATE models SET tpd_limit = NULL, monthly_token_budget = ? WHERE id = ?')
+        .run('~25M', bigModel.modelDbId);
+      db.prepare('UPDATE models SET tpd_limit = NULL, monthly_token_budget = ? WHERE id = ?')
+        .run('~500K', smallModel.modelDbId);
+
+      const { status } = await request(app, 'POST', '/api/fallback/sort/budget');
+      expect(status).toBe(200);
+
+      // Read priorities from the table the route writes for the active
+      // profile (the seeded DB has a default profile; fallback_config is the
+      // no-profile path). GET /api/fallback re-orders by intelligence rank,
+      // so it can't verify the priority the sort wrote.
+      const profileId = (db.prepare("SELECT value FROM settings WHERE key = 'active_profile_id'").get() as any)?.value;
+      const prio = (id: number) => Number(((profileId
+        ? db.prepare('SELECT priority FROM profile_models WHERE profile_id = ? AND model_db_id = ?').get(profileId, id)
+        : db.prepare('SELECT priority FROM fallback_config WHERE model_db_id = ?').get(id)
+      ) as any).priority);
+      // A rate-limit label is "no budget info" (0): the real ~25M budget must
+      // sort first, and even a small ~500K budget beats the inflated label.
+      // With the old parser the RPM label scored 40M and took priority 1.
+      expect(prio(bigModel.modelDbId)).toBeLessThan(prio(rpmModel.modelDbId));
+      expect(prio(smallModel.modelDbId)).toBeLessThan(prio(rpmModel.modelDbId));
+      expect(prio(bigModel.modelDbId)).toBeLessThan(prio(smallModel.modelDbId));
+    } finally {
+      const restore = db.prepare('UPDATE models SET monthly_token_budget = ?, tpd_limit = ? WHERE id = ?');
+      [rpmModel, bigModel, smallModel].forEach((m: any, i: number) =>
+        restore.run(orig[i].monthly_token_budget, orig[i].tpd_limit, m.modelDbId));
     }
   });
 

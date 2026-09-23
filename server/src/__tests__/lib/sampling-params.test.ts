@@ -4,7 +4,9 @@ import {
   extendedBodyParams,
   supportedParametersFor,
   supportedParametersForPlatforms,
+  normalizeReasoningEffort,
   EXTENDED_SAMPLING_KEYS,
+  REASONING_EFFORTS,
 } from '../../lib/sampling-params.js';
 
 describe('pickSamplingParams', () => {
@@ -41,6 +43,7 @@ describe('extendedBodyParams (per-platform policy)', () => {
     top_k: 40, min_p: 0.05, seed: 7, presence_penalty: 1, frequency_penalty: -1,
     repetition_penalty: 1.1, logit_bias: { '50256': -100 }, logprobs: true, top_logprobs: 3,
     response_format: { type: 'json_object' as const },
+    reasoning_effort: 'medium' as const,
   };
 
   it('forwards everything for platforms without a policy', () => {
@@ -66,6 +69,23 @@ describe('extendedBodyParams (per-platform policy)', () => {
     expect(body).not.toHaveProperty('logit_bias');
     expect(body.seed).toBe(7);
     expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('radeon: keeps only documented knobs and clamps reasoning to the shared roster', () => {
+    const body = extendedBodyParams('radeon', { ...allSet, reasoning_effort: 'high' });
+    for (const k of ['top_k', 'min_p', 'seed', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs']) {
+      expect(body).not.toHaveProperty(k);
+    }
+    expect(body.presence_penalty).toBe(1);
+    expect(body.frequency_penalty).toBe(-1);
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.reasoning_effort).toBe('medium');
+  });
+
+  it('radeon: downgrades unsupported JSON Schema output to JSON-object mode', () => {
+    const schema = { type: 'json_schema' as const, json_schema: { name: 'answer', schema: { type: 'object' } } };
+    expect(extendedBodyParams('radeon', { response_format: schema }).response_format)
+      .toEqual({ type: 'json_object' });
   });
 
   it('aihorde: drops the entire extended set', () => {
@@ -101,6 +121,97 @@ describe('supportedParametersFor / supportedParametersForPlatforms', () => {
     expect(both).toContain('seed');
     // single platform = its own list
     expect(supportedParametersForPlatforms(['groq'])).toEqual(supportedParametersFor('groq'));
+  });
+});
+
+describe('reasoning_effort (request-side reasoning control)', () => {
+  it('pickSamplingParams forwards the flat field and drops explicit null', () => {
+    expect(pickSamplingParams({ reasoning_effort: 'low' })).toEqual({ reasoning_effort: 'low' });
+    expect(pickSamplingParams({ reasoning_effort: null })).toEqual({});
+  });
+
+  it('tolerates the object form: reasoning:{effort} resolves to reasoning_effort', () => {
+    expect(pickSamplingParams({ reasoning: { effort: 'high' } })).toEqual({ reasoning_effort: 'high' });
+  });
+
+  it('flat reasoning_effort wins over the object form on conflict', () => {
+    expect(pickSamplingParams({ reasoning_effort: 'low', reasoning: { effort: 'high' } }))
+      .toEqual({ reasoning_effort: 'low' });
+  });
+
+  it('object form without a usable effort is ignored (never forwarded as-is)', () => {
+    expect(pickSamplingParams({ reasoning: null })).toEqual({});
+    expect(pickSamplingParams({ reasoning: {} })).toEqual({});
+    expect(pickSamplingParams({ reasoning: { effort: null } })).toEqual({});
+  });
+
+  it('forwarded verbatim on openai-compat platforms without a droplist entry', () => {
+    expect(extendedBodyParams('groq', { reasoning_effort: 'medium' }).reasoning_effort).toBe('medium');
+    expect(extendedBodyParams('cerebras', { reasoning_effort: 'none' }).reasoning_effort).toBe('none');
+    expect(extendedBodyParams('github', { reasoning_effort: 'high' }).reasoning_effort).toBe('high');
+  });
+
+  it('stripped for platforms with no support (never 400s a strict upstream)', () => {
+    for (const platform of ['mistral', 'cohere', 'cloudflare', 'aihorde']) {
+      expect(extendedBodyParams(platform, { reasoning_effort: 'high' })).not.toHaveProperty('reasoning_effort');
+    }
+  });
+
+  it('a request without the knob sends nothing new (default behavior unchanged)', () => {
+    expect(extendedBodyParams('groq', { seed: 1 })).toEqual({ seed: 1 });
+    expect(pickSamplingParams({ seed: 1 })).toEqual({ seed: 1 });
+  });
+
+  it('advertised in supported_parameters only where it is forwarded', () => {
+    expect(supportedParametersFor('groq')).toContain('reasoning_effort');
+    expect(supportedParametersFor('cerebras')).toContain('reasoning_effort');
+    expect(supportedParametersFor('mistral')).not.toContain('reasoning_effort');
+    expect(supportedParametersFor('cohere')).not.toContain('reasoning_effort');
+  });
+});
+
+describe('reasoning_effort normalization (#619 — off-scale values must not 400)', () => {
+  it('passes supported values through untouched, case/whitespace tolerant', () => {
+    for (const effort of REASONING_EFFORTS) {
+      expect(normalizeReasoningEffort(effort)).toBe(effort);
+    }
+    expect(normalizeReasoningEffort('  High ')).toBe('high');
+  });
+
+  it("clamps 'max' and its spellings to the top of the scale", () => {
+    for (const alias of ['max', 'maximum', 'MAX', 'highest', 'ultra', 'xhigh', 'x-high']) {
+      expect(normalizeReasoningEffort(alias)).toBe('high');
+    }
+  });
+
+  it('clamps the other off-scale spellings to their nearest supported value', () => {
+    expect(normalizeReasoningEffort('mid')).toBe('medium');
+    expect(normalizeReasoningEffort('balanced')).toBe('medium');
+    expect(normalizeReasoningEffort('min')).toBe('minimal');
+    expect(normalizeReasoningEffort('lowest')).toBe('minimal');
+    expect(normalizeReasoningEffort('off')).toBe('none');
+    expect(normalizeReasoningEffort('disabled')).toBe('none');
+  });
+
+  it("drops model-managed modes and anything unrecognizable instead of failing", () => {
+    for (const value of ['auto', 'adaptive', 'default', 'wat', '', 7, null, undefined, {}]) {
+      expect(normalizeReasoningEffort(value)).toBeUndefined();
+    }
+  });
+
+  it('pickSamplingParams clamps rather than forwarding an off-scale value', () => {
+    expect(pickSamplingParams({ reasoning_effort: 'max' })).toEqual({ reasoning_effort: 'high' });
+    expect(pickSamplingParams({ reasoning: { effort: 'max' } })).toEqual({ reasoning_effort: 'high' });
+    expect(pickSamplingParams({ reasoning_effort: 'adaptive' })).toEqual({});
+    expect(pickSamplingParams({ reasoning_effort: 'nonsense', seed: 3 })).toEqual({ seed: 3 });
+  });
+
+  it('per-platform clamping: github takes only low/medium/high', () => {
+    expect(extendedBodyParams('github', { reasoning_effort: 'none' }).reasoning_effort).toBe('low');
+    expect(extendedBodyParams('github', { reasoning_effort: 'minimal' }).reasoning_effort).toBe('low');
+    expect(extendedBodyParams('github', { reasoning_effort: 'medium' }).reasoning_effort).toBe('medium');
+    // Platforms without a restriction still get the value verbatim.
+    expect(extendedBodyParams('groq', { reasoning_effort: 'none' }).reasoning_effort).toBe('none');
   });
 });
 

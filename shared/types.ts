@@ -1,10 +1,27 @@
 // ---- Platform & Model Types ----
 
+/** How the global outbound proxy URL is interpreted. Per-key proxies always
+ * use the traditional forward-proxy transport. */
+export type ProxyMode = 'forward' | 'fetch-relay';
+
+/** A model declared beside a custom endpoint in an import file (#382). A
+ *  capability flag is present only when the paste declared it via a trailing
+ *  -TOOLS / -VISION suffix. */
+export interface ImportModelEntry {
+  id: string;
+  supportsTools?: boolean;
+  supportsVision?: boolean;
+}
+
 export interface PreviewKey {
   keyName: string;
   keyValue: string;
   detectedPlatform: string | null;
   prefix: string;
+  /** Custom endpoints only: the upstream URL the export file carried (#687). */
+  baseUrl?: string;
+  /** Custom endpoints only: models to register alongside the key (#382). */
+  models?: ImportModelEntry[];
   isDuplicate?: boolean;
 }
 
@@ -12,6 +29,8 @@ export interface ImportKey {
   keyName: string;
   keyValue: string;
   platform: string;
+  baseUrl?: string;
+  models?: ImportModelEntry[];
 }
 
 export interface PreviewResponse {
@@ -30,6 +49,8 @@ export interface ImportSelectedResponse {
   skipped: string[];
   errors: Array<{ key: string; error: string }>;
   total: number;
+  /** Models registered for imported custom endpoints (#382). */
+  modelsRegistered: number;
 }
 
 // Active platforms — must match server/src/providers/index.ts and
@@ -43,6 +64,44 @@ export type Platform =
   | 'google'
   | 'groq'
   | 'cerebras'
+  // Sail Research — native Responses API provider. $5 in free credits refreshes
+  // monthly when a payment method is attached; usage beyond the grant is
+  // pay-as-you-go. Background polling is required for its flex-only models.
+  | 'sail'
+  // Responses-only gateway; a shared monthly free allowance, not per model.
+  | 'aclide'
+  // Hosted vision API: $5/workspace in recurring monthly credits, shared
+  // across models. Signed catalog only; no bundled model seeds.
+  | 'moondream'
+  // Hosted gateways; model rows are delivered by the signed catalog only.
+  // ElectronHub renews weekly credits; Experiential renews monthly credits.
+  | 'electronhub'
+  | 'experiential'
+  // Catalog-managed gateways: monthly shared credits vs daily free-model quota.
+  | 'router9'
+  | 'septor'
+  | 'clod'
+  | 'speechify'
+  | 'blaze'
+  // Lucidity Composite, Api.Airforce and DreamPrompting expose daily free
+  // allowances; Waterfall and Logfare publish community / fair-use tiers.
+  | 'lucidity'
+  | 'airforce'
+  | 'dreamprompting'
+  | 'waterfall'
+  | 'logfare'
+  // B.AI — OpenAI-compatible gateway. Its catalog row is a live-tested,
+  // limited-time 0-credit promotion, not a recurring free allowance.
+  | 'bai'
+  // AnyAPI — OpenAI-compatible gateway. Free tier is $0/no card/recurring but
+  // capped at 100K tokens/day over "free and basic" models only; no RPM/RPD is
+  // published. Catalog rows live in the hosted catalog (premium now, free after
+  // 30 days).
+  | 'anyapi'
+  // AMD Radeon Cloud TokenFactory — OpenAI-compatible shared inference. Its
+  // rotating public-model roster is free without consuming instance credits,
+  // with recurring account-level allowance and request/concurrency controls.
+  | 'radeon'
   | 'nvidia'
   | 'mistral'
   | 'sambanova'
@@ -67,8 +126,8 @@ export type Platform =
   // platform.agnes-ai.com (no card).
   | 'agnes'
   // Reka — OpenAI-compatible. Native multimodal models (reka-edge takes
-  // image/video); free via a recurring monthly credit grant, key from
-  // platform.reka.ai (no card).
+  // image/video). New accounts need prepaid credits (#1202); key from
+  // platform.reka.ai.
   | 'reka'
   // SiliconFlow — OpenAI-compatible. Registered for its FREE generative-media
   // models (FLUX.1-schnell image, CosyVoice2 TTS) routed via services/media.ts;
@@ -91,10 +150,77 @@ export type Platform =
   // Requesty — OpenAI-compatible router with no-card free models/credits.
   // Catalog rows live in the Oracle catalog (premium now, free after 30 days).
   | 'requesty'
+  // NavyAI — OpenAI-compatible unified API. Free plan is 150K tokens/day and
+  // 20 RPM; catalog rows live in the Oracle catalog (premium now, free after 30 days).
+  | 'navy'
   // NaraRouter — OpenAI-compatible aggregator. Free account key from
   // router.bynara.id after Telegram channel/link verification; free-plan routes
   // reset daily and are catalog-managed (premium now, free after 30 days).
   | 'nara'
+  // SEA-LION (AI Singapore) — OpenAI-compatible first-party API. Free key
+  // (Google sign-in, no card, no region wall) at 10 RPM; catalog rows live in
+  // the Oracle catalog (premium now, free after 30 days).
+  | 'sealion'
+  // OrcaRouter — OpenAI-compatible aggregator (api.orcarouter.ai/v1). Free key
+  // from orcarouter.ai (no card); recurring rate-limited free aliases at $0
+  // (never fall back to paid). Catalog rows live in the Oracle catalog
+  // (premium now, free after the 30-day model-age gate).
+  | 'orcarouter'
+  // UnoRouter (unorouter.com) — OpenAI-compatible aggregator. The web app is a
+  // Next.js site at unorouter.com; the API lives at api.unorouter.com/v1. Free
+  // key from unorouter.com (no card); free models carry a `:free` suffix and a
+  // per-minute rate limit (429 on cap, e.g. "1 request(s) every 1 min").
+  // Live-probed 2026-08-23: /v1/models is public without a key but 401s on a
+  // wrong key, and /v1/chat/completions 401s without a key, so default key
+  // validation works. Catalog rows live in the hosted catalog (premium now,
+  // free after the 30-day model-age gate).
+  | 'unorouter'
+  // xKiro (xkiro.com) — OpenAI-compatible gateway at api.xkiro.com/v1. Free key
+  // from xkiro.com (no card); free plan is 5M tokens/day on its free models,
+  // paid models 403 on a free key.
+  // /v1/models is public (200 with no key), so key validation must probe
+  // /v1/usage, which 401s on a missing/invalid ClientApiKey. Catalog rows live
+  // in the hosted catalog (premium now, free after the 30-day model-age gate).
+  | 'xkiro'
+  // ModelScope (魔搭社区, Alibaba) — OpenAI-compatible inference API
+  // (api-inference.modelscope.cn/v1). Free tier is 2000 requests/day
+  // account-wide, but calls only work after the ModelScope account is bound to
+  // an Alibaba Cloud CHINA-site (cn) account with Chinese real-name
+  // verification — tokens mint without binding, then every call 401s. Catalog
+  // rows land after community testing confirms per-model behavior (#581).
+  | 'modelscope'
+  // ── Chinese domestic providers (#922/#923/#924) ────────────────────────────
+  // All four need Chinese real-name verification (实名认证) on the cloud account
+  // before a key will serve traffic, the same wall ModelScope hits above.
+  // LongCat is the exception worth knowing: its platform accepts an email
+  // signup from outside mainland China.
+  //
+  // Baidu Qianfan (百度千帆) — OpenAI-compatible (https://qianfan.baidubce.com/v2).
+  // The ERNIE-Speed / ERNIE-Lite / ERNIE-Tiny series are free indefinitely via
+  // pay-as-you-go billing rather than a token pool, so the ceiling is rate
+  // limits, not a balance. Baidu calls the arrangement "long-term". Real-name
+  // auth (individual or enterprise) required.
+  | 'qianfan'
+  // Volcengine Ark (火山方舟, ByteDance) — OpenAI-compatible
+  // (https://ark.cn-beijing.volces.com/api/v3). Individual developers get a
+  // RECURRING daily per-model free reward quota (raised from 500K to 2M
+  // tokens/day/model), on top of a one-time 500K new-user grant. The strongest
+  // recurring free tier of the four.
+  | 'volcengine'
+  // LongCat (Meituan / 美团) — OpenAI-compatible
+  // (https://api.longcat.chat/openai/v1); also exposes an Anthropic-compatible
+  // surface at /anthropic. Free tier is daily; the figure quoted at platform
+  // launch was 100K tokens/day. Meituan has ANNOUNCED a 50M tokens/day
+  // Flash-Lite free tier but it was described as a future plan, so it is not
+  // treated as live here.
+  | 'longcat'
+  // iFlytek Spark (讯飞星火) — OpenAI-compatible
+  // (https://spark-api-open.xf-yun.com/v1), Bearer auth using the console's
+  // APIPassword (not the APIKey/APISecret pair the older WebSocket API used).
+  // The Lite model (model id `lite`) is documented as free to call; iFlytek
+  // does not publish a token ceiling or a QPS figure for it, so neither is
+  // claimed here.
+  | 'xfyun'
   // AI Horde — free, community-powered inference (volunteer workers) via an
   // OpenAI-compatible proxy (https://oai.aihorde.net/v1). Queue-based, so calls
   // can take tens of seconds; no tool support; usage is reported as kudos, not
@@ -123,6 +249,9 @@ export interface Model {
   enabled: boolean;
   supportsVision: boolean;
   supportsTools: boolean;
+  source?: 'catalog' | 'custom';
+  keyId?: number | null;
+  endpointScope?: string | null;
 }
 
 // ---- Quirks ----
@@ -157,10 +286,18 @@ export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unkn
 
 export interface ApiKeyModel {
   id: number;
-  kind: 'chat' | 'embedding' | 'image' | 'audio';
+  kind: 'chat' | 'embedding' | 'image' | 'audio' | 'transcription';
   modelId: string;
   displayName: string;
   family?: string | null;
+}
+
+/** An active rate-limit cooldown on one model for a key. A key can be healthy
+ *  and enabled yet still skipped by the router because of these. */
+export interface ApiKeyCooldown {
+  modelId: string;
+  expiresAtMs: number;
+  remainingMs: number;
 }
 
 export interface ApiKey {
@@ -172,9 +309,19 @@ export interface ApiKey {
   status: KeyStatus;
   enabled: boolean;
   keyless: boolean;
+  /** Whether an export file would actually contain this row. The server decides
+   *  it so the dialog's "will export N keys" cannot drift from the export. */
+  exportable: boolean;
   createdAt: string;
   lastCheckedAt: string | null;
+  lastHealthError: string | null;
+  /** Model ids this key is limited to; null = serves every model of its
+   *  platform (#657). */
+  modelScope?: string[] | null;
+  /** The per-key proxy override with its password masked (#590); '' = none. */
+  maskedProxyUrl?: string;
   models?: ApiKeyModel[];
+  cooldowns?: ApiKeyCooldown[];
 }
 
 export interface ApiKeyCreate {
@@ -279,6 +426,11 @@ export interface ChatMessage {
   // (DeepSeek on OpenCode Zen) require it to be replayed verbatim on the next
   // turn or they 400; the proxy preserves and forwards it. See issue #255.
   reasoning_content?: string;
+  // Moonshot's "partial" prefill flag on an assistant turn: when true, the
+  // model continues the given text instead of starting a fresh turn. Only
+  // forwarded to models that understand it (Moonshot/Kimi); stripped for all
+  // other providers. See issue #1038.
+  partial?: boolean;
 }
 
 export interface ChatCompletionRequest {
@@ -287,6 +439,9 @@ export interface ChatCompletionRequest {
   temperature?: number;
   max_tokens?: number;
   stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
   top_p?: number;
   stop?: string | string[];
   tools?: ChatToolDefinition[];
@@ -307,6 +462,15 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // OpenAI-standard breakdown some providers advertise alongside the totals.
+  // Optional because many free-tier endpoints omit it; the proxy falls back
+  // to its chars/4 estimate when absent. (#764)
+  completion_tokens_details?: { reasoning_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number };
+  // Gateway-synthesized block (upstream never sent usage): flagged so a
+  // cost-accounting client can tell it apart from the upstream's real
+  // counts. (#1084)
+  estimated?: boolean;
 }
 
 export interface ChatCompletionResponse {
@@ -332,10 +496,12 @@ export interface ChatCompletionChunk {
     delta: {
       role?: 'assistant';
       content?: string;
+      reasoning_content?: string;
       tool_calls?: ChatToolCall[];
     };
     finish_reason: string | null;
   }[];
+  usage?: TokenUsage;
 }
 
 // ---- Analytics Types ----
@@ -398,6 +564,8 @@ export type QuotaObservationSource = 'header' | 'quota_api' | 'error_body' | 'lo
 export interface ProviderQuotaState {
   platform: Platform;
   keyId: number;
+  /** The key's operator-facing label, when the row still names a live key. */
+  keyLabel?: string | null;
   quotaPoolKey: string;
   metric: QuotaMetric;
   limit: number | null;
@@ -420,4 +588,77 @@ export interface ProviderQuotaObservation extends ProviderQuotaState {
   endpoint: string | null;
   rawJson: string | null;
   createdAt: string;
+}
+
+export interface QuotaOutlookPool {
+  platform: Platform;
+  pool: string;
+  limit: number | null;
+  remaining: number | null;
+  remainingPct: number | null;
+  observedAt: string | null;
+  resetAt: string | null;
+  /** Successful requests through this instance during the observation window. */
+  recentRequestCount: number;
+  ratePerMin: number;
+  unavailableReason: 'quota_not_reported' | 'stale_observation' | 'reset_not_reported' | 'low_confidence' | null;
+  estimatedExhaustionAt: string | null;
+  status: 'unknown' | 'stale' | 'unavailable' | 'insufficient_data' | 'resets_first' | 'forecast' | 'exhausted';
+  warning: 'low_balance' | 'exhausting_soon' | null;
+}
+
+export interface QuotaOutlookResponse {
+  generatedAt: string;
+  observationWindowMinutes: number;
+  minimumRequests: number;
+  pools: QuotaOutlookPool[];
+}
+
+// ---- Provider Dashboard Types ----
+
+export type ProviderHealthStatus = 'healthy' | 'issues' | 'rate_limited' | 'unknown' | 'unconfigured';
+
+export interface ProviderSummary {
+  platform: Platform;
+  name: string;
+  totalKeys: number;
+  enabledKeys: number;
+  healthyKeys: number;
+  totalModels: number;
+  activeModels: number;
+  status: ProviderHealthStatus;
+  isConfigured: boolean;
+}
+
+export interface GroupedProvider {
+  id: string;
+  platform: Platform;
+  name: string;
+  url?: string;
+  baseUrl?: string | null;
+  endpointScope?: string | null;
+  keyless?: boolean;
+  keys: ApiKey[];
+  models: Model[];
+  summary: ProviderSummary;
+}
+
+export interface CustomModelCreate {
+  platform: Platform;
+  modelId: string;
+  displayName?: string;
+  contextWindow?: number | null;
+  rpmLimit?: number | null;
+  rpdLimit?: number | null;
+  tpmLimit?: number | null;
+  tpdLimit?: number | null;
+  supportsVision?: boolean;
+  supportsTools?: boolean;
+}
+
+export interface ModelTestResult {
+  success: boolean;
+  modelId: string;
+  latencyMs: number;
+  error?: string;
 }

@@ -131,6 +131,49 @@ export function classifyIp(ip: string): AddressClass {
   return 'public';
 }
 
+/**
+ * Hostname half of {@link isLoopbackOrPrivateUrl}: true when a bare hostname
+ * names THIS machine or the LAN. Callers that already parsed the URL (the
+ * proxy router, which needs the hostname for NO_PROXY anyway) use this
+ * directly so the URL is parsed once.
+ *
+ * Normalises the two spellings a URL hostname can arrive in: IPv6 literals are
+ * bracketed (`[::1]`), and the FQDN form carries a trailing dot (`localhost.`
+ * — a real, resolvable spelling that must not slip past as a public name).
+ */
+export function isLoopbackOrPrivateHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (net.isIP(host)) {
+    const cls = classifyIp(host);
+    return cls === 'loopback' || cls === 'private';
+  }
+  return false;
+}
+
+/**
+ * Synchronous locality check for a stored provider base_url: true when the URL
+ * points at THIS machine or the LAN (loopback, RFC1918/ULA private, 'localhost').
+ * Used by the rate limiter to exempt local inference servers (Ollama/llama.cpp/
+ * LM Studio via the 'custom' platform) from cloud-quota cooldown ladders (#592):
+ * a local box has no quota, so long benches only strand the user's one route.
+ *
+ * Deliberately DNS-free so it can sit on the cooldown hot path: literal IPs and
+ * 'localhost'/'*.localhost' are decidable synchronously; any other hostname
+ * (LAN mDNS names included) is pragmatically treated as NON-local — the worst
+ * case there is the pre-existing conservative bench, never a wrong exemption.
+ */
+export function isLoopbackOrPrivateUrl(rawUrl: string | null | undefined): boolean {
+  if (!rawUrl) return false;
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  return isLoopbackOrPrivateHostname(url.hostname);
+}
+
 export interface UrlAssessment {
   allowed: boolean;
   reason?: string;

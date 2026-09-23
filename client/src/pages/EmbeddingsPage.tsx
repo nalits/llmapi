@@ -23,6 +23,7 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
+import { UsageSummaryCard } from '@/components/usage-summary-card'
 import { useI18n } from '@/i18n'
 
 interface ProviderEntry {
@@ -51,7 +52,15 @@ interface EmbeddingsData {
 }
 
 interface UsageData {
-  families: { family: string; requestsToday: number; tokensMonth: number }[]
+  families: {
+    family: string
+    requestsToday: number
+    tokensMonth: number
+    platform?: string | null
+    quotaLabel?: string | null
+  }[]
+  totalTokensMonth?: number
+  totalRequestsToday?: number
 }
 
 function formatTokens(n: number): string {
@@ -251,6 +260,21 @@ export default function EmbeddingsPage() {
         <p className="text-xs text-muted-foreground">
           {t('embeddings.autoDescription')}
         </p>
+
+        {usage && usage.families.length > 0 && (
+          <UsageSummaryCard
+            unit="tokens"
+            total={usage.totalTokensMonth ?? 0}
+            requestsToday={usage.totalRequestsToday ?? 0}
+            rows={usage.families.map(f => ({
+              label: f.family,
+              platform: f.platform ?? null,
+              quotaLabel: f.quotaLabel ?? null,
+              amount: f.tokensMonth,
+              requestsToday: f.requestsToday,
+            }))}
+          />
+        )}
 
         {isLoading ? (
           <>

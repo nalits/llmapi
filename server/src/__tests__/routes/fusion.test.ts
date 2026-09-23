@@ -5,12 +5,14 @@ import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 import { isFusionModel, fusionConfigSchema, familyKey, diversifyChain } from '../../services/fusion.js';
 import { getOrderedFusionChain, setRoutingStrategy, getRoutingStrategy, type FusionCandidate } from '../../services/router.js';
+import * as router from '../../services/router.js';
 import { setCooldown } from '../../services/ratelimit.js';
 
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
   const res = await fetch(url, {
@@ -292,6 +294,203 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
     expect(groqCall?.body.tool_choice).toBe('required');
     expect(groqCall?.body.parallel_tool_calls).toBe(true);
     expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
+    // Tool actions are not mergeable: once the first capable model returns a
+    // structured call, Fusion must not fan out to a second model that could
+    // propose a duplicate side effect.
+    expect(upstream.calls.some(c => c.url.includes('api.cerebras.ai'))).toBe(false);
+  });
+
+  it('keeps looking for a structured call when tool_choice is auto', async () => {
+    const toolCalls = [{
+      id: 'call_auto_exec',
+      type: 'function',
+      function: { name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    }];
+    const upstream = mockUpstreams({
+      'api.groq.com': 'prose-only first candidate',
+      'api.cerebras.ai': { content: null, tool_calls: toolCalls, finish_reason: 'tool_calls' },
+      'openrouter.ai': 'JUDGE SHOULD NOT RUN',
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion',
+      messages: [{ role: 'user', content: 'run the command' }],
+      tools: [{
+        type: 'function',
+        function: { name: 'exec_command', parameters: { type: 'object', properties: { cmd: { type: 'string' } } } },
+      }],
+      // Omitted/auto tool choice is the shape Codex commonly sends.
+      fusion: { models: [toolGroqModel, toolCerebrasModel], judge: openrouterModel },
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(body.choices[0].finish_reason).toBe('tool_calls');
+    expect(body.choices[0].message.tool_calls).toEqual(toolCalls);
+    expect(upstream.calls.some(c => c.url.includes('api.groq.com'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('api.cerebras.ai'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
+  });
+
+  it('tries overflow after prose when an automatic one-model panel requires a tool call', async () => {
+    const toolCalls = [{ id: 'required-overflow', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Dublin"}' } }];
+    vi.spyOn(router, 'getOrderedFusionChain').mockReturnValue([
+      router.resolveFusionCandidate(toolGroqModel)!, router.resolveFusionCandidate(toolCerebrasModel)!,
+    ]);
+    const upstream = mockUpstreams({
+      'api.groq.com': 'prose does not satisfy a required tool call',
+      'api.cerebras.ai': { content: null, tool_calls: toolCalls, finish_reason: 'tool_calls' },
+    });
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion', messages: [{ role: 'user', content: 'Get the weather' }],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } } }],
+      tool_choice: 'required', fusion: { k: 1 },
+    }, authHeaders());
+    expect(status).toBe(200);
+    expect(body.choices[0].message.tool_calls).toEqual(toolCalls);
+    expect(upstream.calls.some(call => call.url.includes('api.cerebras.ai'))).toBe(true);
+    expect(body.execution_id).toBeTruthy();
+  });
+
+  it('keeps the execution ID and server error type when required tool calls fail', async () => {
+    mockUpstreams({ 'api.groq.com': 'prose only' });
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion', messages: [{ role: 'user', content: 'Get the weather' }],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+      tool_choice: 'required', fusion: { models: [toolGroqModel] },
+    }, authHeaders());
+    expect(status).toBe(502);
+    expect(body.error.type).toBe('server_error');
+    expect(body.execution_id).toBeTruthy();
+  });
+
+  it('does not forward a tool call that violates a named tool_choice', async () => {
+    const wrongCall = [{
+      id: 'call_wrong',
+      type: 'function',
+      function: { name: 'get_weather', arguments: '{"city":"Paris"}' },
+    }];
+    const rightCall = [{
+      id: 'call_right',
+      type: 'function',
+      function: { name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    }];
+    const upstream = mockUpstreams({
+      'api.groq.com': { content: null, tool_calls: wrongCall, finish_reason: 'tool_calls' },
+      'api.cerebras.ai': { content: null, tool_calls: rightCall, finish_reason: 'tool_calls' },
+      'openrouter.ai': 'JUDGE SHOULD NOT RUN',
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion',
+      messages: [{ role: 'user', content: 'run the command' }],
+      tools: [{
+        type: 'function',
+        function: { name: 'exec_command', parameters: { type: 'object', properties: { cmd: { type: 'string' } } } },
+      }],
+      tool_choice: { type: 'function', function: { name: 'exec_command' } },
+      fusion: { models: [toolGroqModel, toolCerebrasModel], judge: openrouterModel },
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(body.choices[0].finish_reason).toBe('tool_calls');
+    expect(body.choices[0].message.tool_calls).toEqual(rightCall);
+    expect(upstream.calls.some(c => c.url.includes('api.groq.com'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('api.cerebras.ai'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
+  });
+
+  it('suppresses a provider tool call when tool_choice is none', async () => {
+    const ignoredCall = [{
+      id: 'call_ignored',
+      type: 'function',
+      function: { name: 'exec_command', arguments: '{"cmd":"rm -rf /"}' },
+    }];
+    const upstream = mockUpstreams({
+      'api.groq.com': { content: null, tool_calls: ignoredCall, finish_reason: 'tool_calls' },
+      'api.cerebras.ai': 'safe prose fallback',
+      'openrouter.ai': 'JUDGE SHOULD NOT RUN',
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion',
+      messages: [{ role: 'user', content: 'answer without tools' }],
+      tools: [{
+        type: 'function',
+        function: { name: 'exec_command', parameters: { type: 'object', properties: { cmd: { type: 'string' } } } },
+      }],
+      tool_choice: 'none',
+      fusion: { models: [toolGroqModel, toolCerebrasModel], judge: openrouterModel },
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(body.choices[0].finish_reason).toBe('stop');
+    expect(body.choices[0].message.content).toBe('safe prose fallback');
+    expect(body.choices[0].message.tool_calls).toBeUndefined();
+    expect(upstream.calls.some(c => c.url.includes('api.groq.com'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('api.cerebras.ai'))).toBe(true);
+    expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
+  });
+
+  it('times out a stalled tool candidate before falling back sequentially', async () => {
+    // Keep the unit test fast while exercising the same AbortSignal path used
+    // by the hosted 12s tool deadline. The first provider never answers; the
+    // second returns a valid structured call and must be reached without a
+    // parallel in-flight request.
+    getDb().prepare("INSERT INTO settings (key, value) VALUES ('fusion_tool_timeout_ms', '20') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+    const toolCalls = [{
+      id: 'call_exec',
+      type: 'function',
+      function: { name: 'exec_command', arguments: '{"cmd":"true"}' },
+    }];
+    const calls: string[] = [];
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const u = typeof url === 'string' ? url : url.toString();
+      calls.push(u);
+      if (u.includes('api.groq.com')) {
+        return await new Promise((_resolve, reject) => {
+          const signal = (init as any)?.signal as AbortSignal | undefined;
+          const abort = () => reject(signal?.reason ?? new Error('aborted'));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener('abort', abort, { once: true });
+        }) as any;
+      }
+      if (u.includes('api.cerebras.ai')) {
+        return {
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-timeout-fallback', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: toolCalls }, finish_reason: 'tool_calls' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        } as any;
+      }
+      return origFetch(url as any, init as any);
+    });
+
+    try {
+      const started = Date.now();
+      const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+        model: 'fusion',
+        messages: [{ role: 'user', content: 'run the command' }],
+        tools: [{
+          type: 'function',
+          function: { name: 'exec_command', parameters: { type: 'object', properties: { cmd: { type: 'string' } } } },
+        }],
+        tool_choice: 'required',
+        fusion: { models: [toolGroqModel, toolCerebrasModel] },
+      }, authHeaders());
+
+      expect(status).toBe(200);
+      expect(body.choices[0].finish_reason).toBe('tool_calls');
+      expect(body.choices[0].message.tool_calls).toEqual(toolCalls);
+      expect(calls.filter(u => u.includes('api.groq.com'))).toHaveLength(1);
+      expect(calls.filter(u => u.includes('api.cerebras.ai'))).toHaveLength(1);
+      expect(Date.now() - started).toBeLessThan(2000);
+    } finally {
+      getDb().prepare("DELETE FROM settings WHERE key = 'fusion_tool_timeout_ms'").run();
+    }
   });
 
   it('keeps tool-bearing fusion panels on tool-capable models even with tool_choice none', async () => {
@@ -405,14 +604,14 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
       db.prepare('UPDATE profile_models SET priority = 99999 WHERE model_db_id = ?').run(topSmart.id);
 
       setRoutingStrategy('priority');
-      const p1 = getOrderedFusionChain().map(c => c.modelId);
-      const p2 = getOrderedFusionChain().map(c => c.modelId);
+      const p1 = getOrderedFusionChain(1).map(c => c.modelId);
+      const p2 = getOrderedFusionChain(1).map(c => c.modelId);
       expect(p1.length).toBeGreaterThan(0);
       expect(p2).toEqual(p1);
 
       setRoutingStrategy('smartest');
-      const s1 = getOrderedFusionChain().map(c => c.modelId);
-      const s2 = getOrderedFusionChain().map(c => c.modelId);
+      const s1 = getOrderedFusionChain(1).map(c => c.modelId);
+      const s2 = getOrderedFusionChain(1).map(c => c.modelId);
       expect(s2).toEqual(s1);
 
       expect(s1).not.toEqual(p1);
@@ -428,7 +627,7 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
     const r = await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'k_groq_only', label: 'only-groq' });
     expect(r.status).toBe(201);
 
-    const candidates = getOrderedFusionChain();
+    const candidates = getOrderedFusionChain(1);
     expect(candidates.length).toBeGreaterThan(0);
     // Even though the seeded catalog has many higher-ranked models on other
     // platforms (cerebras, openrouter, opencode…), none are routable without a
@@ -442,14 +641,47 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
     await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'k_groq_cool', label: 'cool' });
     const keyId = (db.prepare("SELECT id FROM api_keys WHERE platform = 'groq'").get() as { id: number }).id;
 
-    const before = getOrderedFusionChain().filter(c => c.platform === 'groq');
+    const before = getOrderedFusionChain(1).filter(c => c.platform === 'groq');
     expect(before.length).toBeGreaterThan(0);
     const target = before[0]; // the top groq model under the strategy
 
     // Bench that exact model+key (as a 402/429 cooldown would), then re-check.
     setCooldown('groq', target.modelId, keyId, 60_000);
-    const after = getOrderedFusionChain();
+    const after = getOrderedFusionChain(1);
     expect(after.find(c => c.modelId === target.modelId)).toBeUndefined();
+  });
+
+  it('auto-panel excludes a model whose context window cannot hold the prompt', async () => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'k_groq_ctx', label: 'ctx' });
+
+    const target = getOrderedFusionChain(1).find(c => c.platform === 'groq');
+    expect(target).toBeDefined();
+    db.prepare('UPDATE models SET context_window = 1000 WHERE platform = ? AND model_id = ?')
+      .run('groq', target!.modelId);
+
+    // Fits: a 500-token prompt is well inside the 1000-token window.
+    expect(getOrderedFusionChain(500).find(c => c.modelId === target!.modelId)).toBeDefined();
+    // Does not fit: the model can NEVER serve this request, so it must not claim
+    // a panel slot. Before this gate it was selected anyway and failed at
+    // dispatch, reported as the misleading "no available key for model".
+    expect(getOrderedFusionChain(5000).find(c => c.modelId === target!.modelId)).toBeUndefined();
+  });
+
+  it('auto-panel treats a null context_window as unknown, not as zero', async () => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'k_groq_null', label: 'nullctx' });
+
+    const target = getOrderedFusionChain(1).find(c => c.platform === 'groq');
+    expect(target).toBeDefined();
+    db.prepare('UPDATE models SET context_window = NULL WHERE platform = ? AND model_id = ?')
+      .run('groq', target!.modelId);
+
+    // An unspecified window must never itself exclude a model, at any size:
+    // same convention the auto-router uses.
+    expect(getOrderedFusionChain(5_000_000).find(c => c.modelId === target!.modelId)).toBeDefined();
   });
 
   it('auto-panel refills failed slots from the fallback chain', async () => {

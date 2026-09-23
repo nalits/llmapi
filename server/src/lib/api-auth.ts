@@ -1,6 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import crypto from 'crypto';
-import { resolveUserFromApiKey } from '../db/index.js';
+import { resolveAuth } from './system-prompt.js';
 import { runWithUser } from './request-context.js';
 
 export function extractApiToken(req: Request): string | undefined {
@@ -13,21 +12,14 @@ export function extractApiToken(req: Request): string | undefined {
   return trimmed || undefined;
 }
 
-function timingSafeStringEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
 /**
- * Authenticate a /v1 request with a per-user unified API key.
+ * Authenticate a /v1 request with a per-user unified API key or sk-cp- profile.
  * Returns null and sends 401 if authentication fails.
  */
 export function authenticateUnifiedKey(req: Request, res: Response): { userId: number } | null {
   const token = extractApiToken(req);
-  const resolved = resolveUserFromApiKey(token);
-  if (!resolved || !token || !timingSafeStringEqual(token, resolved.key)) {
+  const resolved = resolveAuth(token);
+  if (!resolved) {
     // Anthropic clients expect the Anthropic error envelope on /v1/messages
     // (and whenever they send `anthropic-version`).
     const path = req.path || '';

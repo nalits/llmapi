@@ -34,12 +34,14 @@ function fakeRoute(provider: any) {
 function throwingProvider(err: any) {
   return {
     async chatCompletion() { throw err; },
+    // eslint-disable-next-line require-yield -- mock stream that errors immediately.
     async *streamChatCompletion(): AsyncGenerator<any> { throw err; },
   };
 }
 
 async function post(app: Express, path: string, body: any, key: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
