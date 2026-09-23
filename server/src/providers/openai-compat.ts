@@ -340,7 +340,7 @@ export class OpenAICompatProvider extends BaseProvider {
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         };
         out._routed_via = { platform: this.platform, model: modelId };
-        observable.end({ output: out, usage: out.usage, responseModel: out.model, finishReasons: ['tool_calls'], usageSource: 'provider' });
+        observable.end({ output: out, usage: { input: out.usage.prompt_tokens, output: out.usage.completion_tokens, total: out.usage.total_tokens }, responseModel: out.model, finishReasons: ['tool_calls'], usageSource: 'provider' });
         return out;
       }
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);

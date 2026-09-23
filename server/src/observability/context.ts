@@ -118,7 +118,7 @@ export interface FinishRequestOptions {
  *  otherwise leaves the (default UNSET) status — the observation is complete.
  *  No-op for handles with no span (unsampled). */
 export function finishRequest(handle: RequestObservability, opts: FinishRequestOptions = {}): void {
-  if (handle.sampled === false) return;
+  if (!handle.ctx.sampled) return;
   if (opts.error != null) {
     handle.span.setStatus({ code: SpanStatusCode.ERROR });
     if (opts.statusCode != null) handle.span.setAttribute('http.response.status_code', opts.statusCode);

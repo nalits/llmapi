@@ -9,7 +9,7 @@ import { ROOT_CONTEXT, trace, type Context, type Span, type Tracer } from '@open
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeSDK } from '@opentelemetry/sdk-node';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 import { langfuseOtelEndpoint, type LangfuseObservabilityConfig } from './config.js';
 
@@ -59,7 +59,7 @@ export function initObservability(cfg: LangfuseObservabilityConfig): InitResult 
   const attributes: Record<string, string> = { [ATTR_SERVICE_NAME]: 'freellmapi' };
   if (cfg.release && cfg.release !== 'unknown') attributes[ATTR_SERVICE_VERSION] = cfg.release;
   attributes['deployment.environment'] = cfg.environment;
-  const resource = new Resource(attributes);
+  const resource = resourceFromAttributes(attributes);
 
   sdk = new NodeSDK({
     resource,
