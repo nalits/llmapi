@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting, getDb } from '../db/index.js';
+import { requireAdmin } from '../middleware/requireAuth.js';
+import { ensureEnrollmentInviteCode, rotateEnrollmentInviteCode } from '../services/auth.js';
 import { applyProxyUrl, applyProxyMode, applyProxyEnabled, applyProxyBypass, applyFetchRelayToken, encodeFetchRelayToken, isProxyActive, getProxyUrl, getProxyMode, getFetchRelayToken, isProxyEnabled, getProxyBypassPlatforms, probeProxyUrl, fetchRelayUrlError, DEFAULT_PROXY_PROBE_TARGET, PROXY_MODES, PROXY_SCHEMES } from '../lib/proxy.js';
 import { getProvider } from '../providers/index.js';
 import type { Platform } from '@freellmapi/shared/types.js';
@@ -395,6 +397,16 @@ settingsRouter.get('/api-key', (_req: Request, res: Response) => {
 settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
   const newKey = regenerateUnifiedKey();
   res.json({ apiKey: newKey });
+});
+
+// Admin-only: view the shared enrollment invite code.
+settingsRouter.get('/invite-code', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ inviteCode: ensureEnrollmentInviteCode() });
+});
+
+// Admin-only: rotate the enrollment invite code (invalidates the previous one).
+settingsRouter.post('/invite-code/rotate', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ inviteCode: rotateEnrollmentInviteCode() });
 });
 
 // Get the proxy settings
