@@ -32,7 +32,7 @@ function mintInviteCode(): string {
 }
 
 function mintUnifiedKey(): string {
-  return `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+  return `llmapi-${crypto.randomBytes(24).toString('hex')}`;
 }
 
 function tableExists(db: Db, name: string): boolean {

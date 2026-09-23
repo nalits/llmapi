@@ -363,9 +363,6 @@ function seedModels(db: Db) {
  */
 function migrateModels(db: Db) {
   // 1) Replace outdated models in-place (preserves fallback_config & any references)
-  const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
-    // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
-  ];
   const renameStmt = db.prepare(`
     UPDATE models
        SET model_id = ?, display_name = ?, intelligence_rank = ?,
@@ -2114,7 +2111,7 @@ function migrateQuirksV1(db: Db) {
       title: 'No API key required',
       body: 'Routes anonymously — the catalog ships a keyless sentinel row and calls work with no account or key.',
       severity: 'info',
-      targets: [{ platform: 'kilo' }, { platform: 'llm7' }, { platform: 'pollinations' }, { platform: 'ovh' }],
+      targets: [{ platform: 'kilo' }, { platform: 'llm7' }, { platform: 'ovh' }],
     },
     {
       slug: 'ovh-anon-trickle',
@@ -2125,8 +2122,8 @@ function migrateQuirksV1(db: Db) {
     },
     {
       slug: 'pollinations-degraded',
-      title: 'Anon tier degraded (1 concurrent)',
-      body: 'Pollinations’ legacy text API is deprecated for authenticated users (replacement enter.pollinations.ai is pay-as-you-go), but anonymous access is explicitly unaffected. Anon is queue-limited to 1 concurrent request per IP and serves a single model (openai-fast); expect 429 "Queue full" under any parallelism. Live-probed 2026-06-10.',
+      title: 'Publishable key uses recurring shared capacity',
+      body: 'Pollinations chat uses https://gen.pollinations.ai/v1 with a free publishable API key. Shared free capacity currently accrues at one pollen per IP per hour; the legacy text host is no longer used.',
       severity: 'warning',
       targets: [{ platform: 'pollinations' }],
     },
@@ -2241,8 +2238,27 @@ function ensureUnifiedKey(db: Db) {
   if (!existing) {
     const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
+    // A direct stdout write bypasses the process-wide console redaction, so it
+    // is only safe for a deliberate local-development session with an attached
+    // terminal. Production, CI, and container startup must never put this
+    // credential in a log stream; the dashboard is the safe retrieval path.
+    if (isInteractiveLocalDevelopment()) {
+      process.stdout.write(`\n  Your unified API key: ${key}\n\n`);
+    } else {
+      console.log(
+        '\n  A unified API key was generated. Open the dashboard and retrieve it from the Keys page.\n' +
+        '  The key is intentionally not printed to logs.\n',
+      );
+    }
   }
+}
+
+function isInteractiveLocalDevelopment(): boolean {
+  const nodeEnv = process.env.NODE_ENV?.trim().toLowerCase() || 'development';
+  return nodeEnv === 'development'
+    && process.stdout.isTTY === true
+    && !process.env.CI
+    && !process.env.KUBERNETES_SERVICE_HOST;
 }
 
 /**

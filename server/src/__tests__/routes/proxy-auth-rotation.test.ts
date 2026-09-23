@@ -22,8 +22,17 @@ vi.mock('../../providers/index.js', async (importOriginal) => {
   };
 });
 
-const { mockCheckKeyHealth } = vi.hoisted(() => ({ mockCheckKeyHealth: vi.fn() }));
-vi.mock('../../services/health.js', () => ({ checkKeyHealth: mockCheckKeyHealth }));
+const { mockCheckKeyHealth, mockMarkKeyHealthy } = vi.hoisted(() => ({
+  mockCheckKeyHealth: vi.fn(),
+  mockMarkKeyHealthy: vi.fn(),
+}));
+// Both exports must be stubbed: recordUpstreamSuccess calls
+// markKeyHealthyFromRequest, and a missing stub would throw on the success path
+// and surface as a 502 rather than the 200 under test.
+vi.mock('../../services/health.js', () => ({
+  checkKeyHealth: mockCheckKeyHealth,
+  markKeyHealthyFromRequest: mockMarkKeyHealthy,
+}));
 
 const { createApp } = await import('../../app.js');
 const { initDb, getDb, getUnifiedApiKey } = await import('../../db/index.js');
@@ -31,7 +40,8 @@ const { encrypt } = await import('../../lib/crypto.js');
 const { setRoutingStrategy, getAllPenalties } = await import('../../services/router.js');
 
 async function post(app: Express, path: string, body: any, key: string, extraHeaders: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',

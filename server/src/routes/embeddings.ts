@@ -2,13 +2,14 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb, setSetting } from '../db/index.js';
-import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { decrypt, maskKey } from '../lib/crypto.js';
 import { deleteUnusedCustomEndpointKey } from '../lib/custom-provider-cleanup.js';
-import { requireUserId } from '../lib/request-context.js';
+import { resolveCustomEndpointKey } from '../services/custom-endpoint.js';
 import {
   listEmbeddingModels,
   getDefaultFamily,
   probeEmbeddingDimensions,
+  registerCustomEmbeddingModel,
   EmbeddingsError,
   type EmbeddingModelRow,
 } from '../services/embeddings.js';
@@ -95,7 +96,10 @@ embeddingsRouter.post('/custom', async (req: Request, res: Response) => {
     res.status(400).json({ error: { message: 'model is required' } });
     return;
   }
-  const displayName = parsed.data.displayName?.trim() || modelId;
+  // Optional: NULL means "no opinion". A new model takes its id, and a model
+  // already on record keeps the name it has instead of being reset by a submit
+  // that simply left the field blank (#704).
+  const submittedName = parsed.data.displayName?.trim() || null;
   const family = parsed.data.family?.trim() || modelId;
   const providedKey = parsed.data.apiKey?.trim() || undefined;
   const label = parsed.data.label?.trim() || undefined;
@@ -120,94 +124,39 @@ embeddingsRouter.post('/custom', async (req: Request, res: Response) => {
     return;
   }
 
-  const sibling = db.prepare(`
-    SELECT dimensions
-      FROM embedding_models
-     WHERE family = ?
-       AND NOT (platform = 'custom' AND model_id = ?)
-     LIMIT 1
-  `).get(family, modelId) as { dimensions: number } | undefined;
-  if (sibling && sibling.dimensions !== dimensions) {
-    res.status(400).json({
-      error: {
-        message: `Embedding family '${family}' is ${sibling.dimensions} dimensions, but '${modelId}' returned ${dimensions}. Use a new family name.`,
-      },
-    });
-    return;
-  }
-
   const upsert = db.transaction(() => {
-    let keyId: number;
-    let storedKeyForMask = probeKey;
-    if (existingKey) {
-      keyId = existingKey.id;
-      if (providedKey) {
-        const { encrypted, iv, authTag } = encrypt(providedKey);
-        db.prepare(`
-          UPDATE api_keys
-             SET label = COALESCE(?, label),
-                 encrypted_key = ?,
-                 iv = ?,
-                 auth_tag = ?,
-                 status = 'unknown',
-                 enabled = 1
-           WHERE id = ?
-        `).run(label ?? null, encrypted, iv, authTag, keyId);
-        storedKeyForMask = providedKey;
-      } else {
-        db.prepare(`
-          UPDATE api_keys
-             SET label = COALESCE(?, label), status = 'unknown', enabled = 1
-           WHERE id = ?
-        `).run(label ?? null, keyId);
-      }
-    } else {
-      const keyToStore = providedKey ?? 'no-key';
-      const { encrypted, iv, authTag } = encrypt(keyToStore);
-      const key = db.prepare(`
-        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
-        VALUES ('custom', ?, ?, ?, ?, 'unknown', 1, ?)
-      `).run(label ?? 'Custom', encrypted, iv, authTag, baseUrl);
-      keyId = Number(key.lastInsertRowid);
-      storedKeyForMask = keyToStore;
-    }
-
-    const existingModel = db.prepare(`
-      SELECT id, priority
-        FROM embedding_models
-       WHERE platform = 'custom' AND model_id = ?
-       LIMIT 1
-    `).get(modelId) as { id: number; priority: number } | undefined;
-    const priority = existingModel?.priority ?? (
-      (db.prepare('SELECT COALESCE(MAX(priority), 0) AS maxPriority FROM embedding_models WHERE family = ?')
-        .get(family) as { maxPriority: number }).maxPriority + 1
-    );
-
-    if (existingModel) {
-      db.prepare(`
-        UPDATE embedding_models
-           SET family = ?,
-               display_name = ?,
-               dimensions = ?,
-               max_input_tokens = ?,
-               priority = ?,
-               enabled = 1,
-               quota_label = ?,
-               key_id = ?
-         WHERE id = ?
-      `).run(family, displayName, dimensions, parsed.data.maxInputTokens ?? null, priority, quotaLabel, keyId, existingModel.id);
-      return { modelDbId: existingModel.id, keyId, storedKeyForMask };
-    }
-
-    const model = db.prepare(`
-      INSERT INTO embedding_models
-        (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label, key_id, user_id)
-      VALUES (?, 'custom', ?, ?, ?, ?, ?, 1, ?, ?, ?)
-    `).run(family, modelId, displayName, dimensions, parsed.data.maxInputTokens ?? null, priority, quotaLabel, keyId, requireUserId());
-    return { modelDbId: Number(model.lastInsertRowid), keyId, storedKeyForMask };
+    // A new secret for a known endpoint is an ADDITIONAL credential, never a
+    // replacement for the stored one (#619).
+    const { keyId, storedKey: storedKeyForMask } = resolveCustomEndpointKey(db, baseUrl, providedKey, label);
+    const { modelDbId } = registerCustomEmbeddingModel(db, {
+      keyId,
+      modelId,
+      displayName: submittedName,
+      family,
+      dimensions,
+      maxInputTokens: parsed.data.maxInputTokens ?? null,
+      quotaLabel,
+    });
+    return { modelDbId, keyId, storedKeyForMask };
   });
 
-  const result = upsert();
+  // A family-dimension conflict aborts the transaction, so a rejected submit
+  // leaves no half-registered key row behind.
+  let result: { modelDbId: number; keyId: number; storedKeyForMask: string };
+  try {
+    result = upsert();
+  } catch (err: any) {
+    if (err instanceof EmbeddingsError) {
+      // `upstream_error`, never `authentication_error`: this status is relayed
+      // from the operator's own endpoint, and a client that reads a bare 401 as
+      // "session expired" would sign the operator out for testing a bad key.
+      res.status(err.status).json({ error: { message: err.message, type: 'upstream_error' } });
+      return;
+    }
+    throw err;
+  }
+  const storedName = (db.prepare('SELECT display_name FROM embedding_models WHERE id = ?')
+    .get(result.modelDbId) as { display_name: string }).display_name;
   res.status(201).json({
     success: true,
     keyId: result.keyId,
@@ -215,7 +164,7 @@ embeddingsRouter.post('/custom', async (req: Request, res: Response) => {
     platform: 'custom',
     baseUrl,
     model: modelId,
-    displayName,
+    displayName: storedName,
     family,
     dimensions,
     maskedKey: maskKey(result.storedKeyForMask),
@@ -287,6 +236,13 @@ embeddingsRouter.delete('/custom/:id', (req: Request, res: Response) => {
 
 // Per-family usage: requests today (most embedding quotas are daily/RPM) and
 // tokens this calendar month, from the tagged request log.
+//
+// Deliberately no budget denominator. `models.monthly_token_budget` gives chat
+// a real number to divide by; `embedding_models` only carries a free-text
+// `quota_label` ("10K neurons/day (shared)", "$0.10/mo credits"), and there is
+// no honest conversion from Cloudflare Neurons or dollar credits to tokens. So
+// the summary reports what was actually spent and shows each provider's quota
+// label verbatim, rather than inventing a ceiling to draw a percentage against.
 embeddingsRouter.get('/usage', (_req: Request, res: Response) => {
   const db = getDb();
   const usage = db.prepare(`
@@ -303,11 +259,28 @@ embeddingsRouter.get('/usage', (_req: Request, res: Response) => {
     GROUP BY em.family
   `).all() as { family: string; requests_today: number; tokens_month: number }[];
 
+  // One representative provider per family for the legend: the highest-priority
+  // enabled row, so the label matches whoever actually serves the family first.
+  const meta = db.prepare(`
+    SELECT family, platform, quota_label
+    FROM embedding_models
+    WHERE enabled = 1
+    ORDER BY priority ASC
+  `).all() as { family: string; platform: string; quota_label: string | null }[];
+  const metaByFamily = new Map<string, { platform: string; quota_label: string | null }>();
+  for (const m of meta) if (!metaByFamily.has(m.family)) metaByFamily.set(m.family, m);
+
+  const families = usage.map(u => ({
+    family: u.family,
+    requestsToday: u.requests_today,
+    tokensMonth: u.tokens_month,
+    platform: metaByFamily.get(u.family)?.platform ?? null,
+    quotaLabel: metaByFamily.get(u.family)?.quota_label ?? null,
+  }));
+
   res.json({
-    families: usage.map(u => ({
-      family: u.family,
-      requestsToday: u.requests_today,
-      tokensMonth: u.tokens_month,
-    })),
+    families,
+    totalTokensMonth: families.reduce((s, f) => s + f.tokensMonth, 0),
+    totalRequestsToday: families.reduce((s, f) => s + f.requestsToday, 0),
   });
 });

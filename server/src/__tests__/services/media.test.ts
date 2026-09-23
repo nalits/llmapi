@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { runImageGeneration, runSpeech, MediaError } from '../../services/media.js';
+import { runImageGeneration, runVideoGeneration, runSpeech } from '../../services/media.js';
 
 const realFetch = globalThis.fetch;
 
@@ -22,11 +22,18 @@ function addCustomKey(baseUrl: string, raw = 'custom-media-key'): number {
   return Number(row.lastInsertRowid);
 }
 
-function addMedia(platform: string, modelId: string, modality: 'image' | 'audio', priority = 1, keyId: number | null = null) {
+function addMedia(
+  platform: string,
+  modelId: string,
+  modality: 'image' | 'video' | 'audio',
+  priority = 1,
+  keyId: number | null = null,
+  metaJson: string | null = null,
+) {
   getDb().prepare(`
-    INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id)
-    VALUES (?, ?, ?, ?, ?, 1, '', ?)
-  `).run(platform, modelId, modelId, modality, priority, keyId);
+    INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id, meta_json)
+    VALUES (?, ?, ?, ?, ?, 1, '', ?, ?)
+  `).run(platform, modelId, modelId, modality, priority, keyId, metaJson);
 }
 
 function jsonResponse(body: unknown) {
@@ -51,6 +58,35 @@ describe('media service', () => {
     expect(cols).toContain('key_id');
   });
 
+  it('skips capped provider keys and keeps a reservation until image generation completes', async () => {
+    addMedia('nvidia', 'black-forest-labs/flux.1-schnell', 'image');
+    addKey('nvidia', 'spent-key');
+    addKey('nvidia', 'available-key');
+    const db = getDb();
+    const keys = db.prepare('SELECT id FROM api_keys ORDER BY id').all() as { id: number }[];
+    db.prepare('UPDATE api_keys SET monthly_request_cap = 1').run();
+    db.prepare(`INSERT INTO requests (platform, model_id, key_id, status, latency_ms)
+      VALUES ('nvidia', 'chat-model', ?, 'success', 1)`).run(keys[0].id);
+    let finish!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>(resolve => { finish = resolve; }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const first = runImageGeneration('auto', { prompt: 'a cat' });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const request = (fetchMock.mock.calls as unknown as [string, RequestInit][])[0][1];
+    expect(new Headers(request.headers).get('Authorization')).toBe('Bearer available-key');
+    await expect(runImageGeneration('auto', { prompt: 'a cat' })).rejects.toMatchObject({ status: 429, code: 'quota_exceeded' });
+    finish(jsonResponse({ artifacts: [{ base64: 'AAAA' }] }));
+    await expect(first).resolves.toMatchObject({ platform: 'nvidia' });
+    expect(db.prepare('SELECT requests FROM key_monthly_usage WHERE key_id = ?').get(keys[1].id)).toEqual({ requests: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // A failed attempt does not consume another request, and cannot leak its reservation.
+    db.prepare('UPDATE api_keys SET monthly_request_cap = 2 WHERE id = ?').run(keys[1].id);
+    fetchMock.mockResolvedValue(new Response('unavailable', { status: 503 }));
+    await expect(runImageGeneration('auto', { prompt: 'a cat' })).rejects.toMatchObject({ status: 502 });
+    fetchMock.mockResolvedValue(jsonResponse({ artifacts: [{ base64: 'BBBB' }] }));
+    await expect(runImageGeneration('auto', { prompt: 'a cat' })).resolves.toMatchObject({ platform: 'nvidia' });
+  });
+
   describe('image generation', () => {
     it('NVIDIA: maps artifacts[].base64 → b64_json', async () => {
       addMedia('nvidia', 'black-forest-labs/flux.1-schnell', 'image');
@@ -59,6 +95,46 @@ describe('media service', () => {
       const r = await runImageGeneration('black-forest-labs/flux.1-schnell', { prompt: 'a cat' });
       expect(r.platform).toBe('nvidia');
       expect(r.images[0].b64_json).toBe('AAAA');
+    });
+
+    it('NVIDIA FLUX.1 Dev: sends the validated 28-step 1024x1024 payload', async () => {
+      addMedia('nvidia', 'black-forest-labs/flux.1-dev', 'image');
+      addKey('nvidia');
+      const fetchMock = vi.fn(async () => jsonResponse({ artifacts: [{ base64: 'DEV' }] }));
+      globalThis.fetch = fetchMock as any;
+
+      await runImageGeneration('black-forest-labs/flux.1-dev', {
+        prompt: 'a lighthouse',
+        size: '512x512',
+      });
+
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body).toEqual({
+        prompt: 'a lighthouse',
+        mode: 'base',
+        steps: 28,
+        width: 1024,
+        height: 1024,
+        cfg_scale: 3.5,
+      });
+    });
+
+    it('NVIDIA FLUX.2 Klein 4B: omits unsupported mode and guidance fields', async () => {
+      addMedia('nvidia', 'black-forest-labs/flux.2-klein-4b', 'image');
+      addKey('nvidia');
+      const fetchMock = vi.fn(async () => jsonResponse({ artifacts: [{ base64: 'KLEIN' }] }));
+      globalThis.fetch = fetchMock as any;
+
+      await runImageGeneration('black-forest-labs/flux.2-klein-4b', {
+        prompt: 'a red kite',
+        size: '512x512',
+      });
+
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body).toEqual({ prompt: 'a red kite', steps: 4, width: 1024, height: 1024 });
+      expect(body).not.toHaveProperty('mode');
+      expect(body).not.toHaveProperty('guidance');
+      expect(body).not.toHaveProperty('cfg_scale');
     });
 
     it('Pollinations: keyless GET, raw bytes → b64_json (no api key needed)', async () => {
@@ -70,12 +146,37 @@ describe('media service', () => {
       expect(r.images[0].b64_json).toBe(Buffer.from('PNGDATA').toString('base64'));
     });
 
-    it('Cloudflare: JSON {result.image} → b64_json', async () => {
+    it('Cloudflare FLUX.1 Schnell: sends only the prompt and maps result.image', async () => {
       addMedia('cloudflare', '@cf/black-forest-labs/flux-1-schnell', 'image');
       addKey('cloudflare', 'acct123:token456');
-      globalThis.fetch = vi.fn(async () => jsonResponse({ result: { image: 'CFB64' }, success: true })) as any;
+      const fetchMock = vi.fn(async () => jsonResponse({ result: { image: 'CFB64' }, success: true }));
+      globalThis.fetch = fetchMock as any;
       const r = await runImageGeneration('@cf/black-forest-labs/flux-1-schnell', { prompt: 'x' });
       expect(r.images[0].b64_json).toBe('CFB64');
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+      expect(JSON.parse(String(init.body))).toEqual({ prompt: 'x' });
+    });
+
+    it('Cloudflare: requestStyle multipart sends form-data (FLUX.2 rejects JSON)', async () => {
+      addMedia('cloudflare', '@cf/black-forest-labs/flux-2-klein-4b', 'image', 1, null,
+        JSON.stringify({ requestStyle: 'multipart' }));
+      addKey('cloudflare', 'acct123:token456');
+      const fetchMock = vi.fn(async () => jsonResponse({ result: { image: 'KLEINB64' }, success: true }));
+      globalThis.fetch = fetchMock as any;
+      const r = await runImageGeneration('@cf/black-forest-labs/flux-2-klein-4b', {
+        prompt: 'a small blue square',
+        size: '512x512',
+      });
+      expect(r.images[0].b64_json).toBe('KLEINB64');
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      expect(init.body).toBeInstanceOf(FormData);
+      const form = init.body as FormData;
+      expect(form.get('prompt')).toBe('a small blue square');
+      expect(form.get('width')).toBe('512');
+      expect(form.get('height')).toBe('512');
+      // Content-Type must stay unset so fetch supplies the multipart boundary.
+      expect((init.headers as Record<string, string>)['Content-Type']).toBeUndefined();
     });
 
     it('Cloudflare: binary SDXL response → b64_json', async () => {
@@ -149,47 +250,333 @@ describe('media service', () => {
     });
   });
 
+  describe('video generation', () => {
+    it('Pollinations: sends the authenticated nova-reel request and returns MP4 bytes', async () => {
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      const fetchMock = vi.fn(async () =>
+        new Response(Buffer.from('MP4DATA'), { status: 200, headers: { 'content-type': 'video/mp4' } }));
+      globalThis.fetch = fetchMock as any;
+
+      const result = await runVideoGeneration('nova-reel', {
+        prompt: 'sunrise over a lake',
+        duration: 12,
+        aspectRatio: '16:9',
+        seed: 7,
+      });
+
+      expect(result.platform).toBe('pollinations');
+      expect(result.video.toString()).toBe('MP4DATA');
+      expect(result.contentType).toBe('video/mp4');
+      const url = new URL(String(fetchMock.mock.calls[0][0]));
+      expect(url.pathname).toBe('/video/sunrise%20over%20a%20lake');
+      expect(url.searchParams.get('model')).toBe('nova-reel');
+      expect(url.searchParams.get('duration')).toBe('12');
+      expect(url.searchParams.get('aspectRatio')).toBe('16:9');
+      expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({
+        Authorization: 'Bearer sk_pollinations_test',
+      });
+    });
+
+    it('Pollinations: omits duration entirely when the caller did not ask for one', async () => {
+      // Allowed lengths differ per model (nova-reel 6-120 by 6, veo 4/6/8,
+      // minimax-h3 exactly 5), so guessing one would 400 on most of the
+      // roster. No duration means the provider uses the model's own default.
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      const fetchMock = vi.fn(async () =>
+        new Response(Buffer.from('MP4DATA'), { status: 200, headers: { 'content-type': 'video/mp4' } }));
+      globalThis.fetch = fetchMock as any;
+
+      await runVideoGeneration('nova-reel', { prompt: 'sunrise over a lake' });
+
+      const url = new URL(String(fetchMock.mock.calls[0][0]));
+      expect(url.searchParams.has('duration')).toBe(false);
+      expect(url.searchParams.get('model')).toBe('nova-reel');
+    });
+
+    it('Pollinations: rejects unsupported nova-reel durations before calling upstream', async () => {
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations');
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('nova-reel', {
+        prompt: 'x',
+        duration: 7,
+      })).rejects.toMatchObject({ status: 400 });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('Hugging Face: submits and resolves the fal.ai queue without leaking the token to the media URL', async () => {
+      addMedia(
+        'huggingface',
+        'Lightricks/LTX-Video-0.9.5',
+        'video',
+        1,
+        null,
+        JSON.stringify({ providerModelId: 'fal-ai/ltx-video-v095' }),
+      );
+      addKey('huggingface', 'hf_test_token');
+      // The submit is answered with a job that is still queued, so the poll
+      // loop actually runs: an unmatched URL is a hard failure rather than
+      // falling through to a canned COMPLETED reply.
+      const submitUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095?_subdomain=queue';
+      const jobUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095/requests/job-1?_subdomain=queue';
+      const statusUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095/requests/job-1/status?_subdomain=queue';
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === submitUrl) {
+          return jsonResponse({
+            request_id: 'job-1',
+            status: 'IN_QUEUE',
+            response_url: 'https://queue.fal.run/fal-ai/ltx-video-v095/requests/job-1',
+          });
+        }
+        if (url === statusUrl) return jsonResponse({ status: 'COMPLETED' });
+        if (url === jobUrl) {
+          return jsonResponse({ video: { url: 'https://cdn.example.test/video.mp4', content_type: 'video/mp4' } });
+        }
+        if (url === 'https://cdn.example.test/video.mp4') {
+          return new Response(Buffer.from('HFVIDEO'), { status: 200, headers: { 'content-type': 'video/mp4' } });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as any;
+
+      const result = await runVideoGeneration('Lightricks/LTX-Video-0.9.5', {
+        prompt: 'paper boats on a stream',
+        seed: 42,
+      });
+
+      expect(result.video.toString()).toBe('HFVIDEO');
+      expect(fetchMock.mock.calls.map(c => String(c[0]))).toEqual([
+        submitUrl,
+        statusUrl,
+        jobUrl,
+        'https://cdn.example.test/video.mp4',
+      ]);
+      expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+        prompt: 'paper boats on a stream',
+        seed: 42,
+      });
+      // The status and result reads are authenticated; the CDN download is not,
+      // so the HF token never reaches a host named by an upstream response.
+      expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toMatchObject({
+        Authorization: 'Bearer hf_test_token',
+      });
+      expect((fetchMock.mock.calls[3][1] as RequestInit).headers).toBeUndefined();
+    });
+
+    it('stops the chain when the API caller hangs up instead of paying for a second provider', async () => {
+      addMedia('pollinations', 'nova-reel', 'video', 1);
+      addMedia('pollinations', 'wan-fast', 'video', 2);
+      addKey('pollinations', 'sk_pollinations_test');
+      const controller = new AbortController();
+      const fetchMock = vi.fn(async () => {
+        controller.abort();
+        throw new Error('socket hang up');
+      });
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('auto', { prompt: 'x' }, controller.signal))
+        .rejects.toMatchObject({ status: 499 });
+      // The second catalogued provider is never attempted.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports an upstream key rejection as an upstream failure, not a caller auth error', async () => {
+      // A 401 from the provider means the OPERATOR's key was refused. Passing
+      // it to the caller would tell an OpenAI SDK that its own gateway key is
+      // bad; a caller-attributable 400 does travel through.
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      globalThis.fetch = vi.fn(async () => new Response('nope', { status: 401 })) as any;
+      await expect(runVideoGeneration('nova-reel', { prompt: 'x' }))
+        .rejects.toMatchObject({ status: 502 });
+
+      globalThis.fetch = vi.fn(async () => new Response('bad prompt', { status: 400 })) as any;
+      await expect(runVideoGeneration('nova-reel', { prompt: 'x' }))
+        .rejects.toMatchObject({ status: 400 });
+    });
+
+    it('Hugging Face: refuses a result URL that points at a blocked address class', async () => {
+      // The result URL is the one URL in this adapter that comes out of an
+      // upstream JSON body, so it goes through the same guard custom-provider
+      // base URLs do (#440) instead of being fetched and streamed back.
+      addMedia(
+        'huggingface',
+        'Lightricks/LTX-Video-0.9.5',
+        'video',
+        1,
+        null,
+        JSON.stringify({ providerModelId: 'fal-ai/ltx-video-v095' }),
+      );
+      addKey('huggingface', 'hf_test_token');
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('requests/job-1?_subdomain=queue')) {
+          return jsonResponse({ video: { url: 'http://169.254.169.254/latest/meta-data/' } });
+        }
+        return jsonResponse({
+          request_id: 'job-1',
+          status: 'COMPLETED',
+          response_url: 'https://queue.fal.run/fal-ai/ltx-video-v095/requests/job-1',
+        });
+      });
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('Lightricks/LTX-Video-0.9.5', { prompt: 'x' }))
+        .rejects.toThrow(/unusable video URL/);
+      // Submit + result read only; the metadata address was never contacted.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('text-to-speech', () => {
+    it.each(['simba-3.0', 'simba-3.2'])('Speechify %s sends native fields and decodes JSON audio', async model => {
+      addMedia('speechify', model, 'audio');
+      addKey('speechify');
+      const audio = Buffer.from('ID3test-audio');
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ audio_data: audio.toString('base64'), audio_format: 'mp3', billable_characters_count: 5 }));
+      const result = await runSpeech(model, { input: 'Hello', voice: 'alloy' });
+      expect(result.audio).toEqual(audio);
+      expect(result.contentType).toBe('audio/mpeg');
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('https://api.speechify.ai/v1/audio/speech');
+      expect(new Headers(init?.headers).get('Speechify-Version')).toBe('2026-09-08');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer speechify-test-key');
+      expect(JSON.parse(String(init?.body))).toEqual({ model, input: 'Hello', voice_id: 'alec', audio_format: 'mp3' });
+    });
+
+    it('Speechify preserves native voices and requested supported formats', async () => {
+      addMedia('speechify', 'test-simba', 'audio'); addKey('speechify');
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ audio_data: 'T2dnUw==', audio_format: 'ogg' }));
+      const result = await runSpeech('test-simba', { input: 'Hello', voice: 'native-voice-id', format: 'ogg' });
+      expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({ voice_id: 'native-voice-id', audio_format: 'ogg' });
+      expect(result.contentType).toBe('audio/ogg');
+    });
+
+    it.each(['pcm', 'flac', 'opus'])('Speechify rejects unsupported %s without sending a request', async format => {
+      addMedia('speechify', 'test-simba', 'audio'); addKey('speechify');
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      await expect(runSpeech('test-simba', { input: 'Hello', format })).rejects.toThrow('Speechify supports');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([{}, { audio_data: 'not base64', audio_format: 'mp3' }, { audio_data: '', audio_format: 'mp3' }, { audio_data: 'SUQz', audio_format: 'wav' }])('Speechify rejects malformed audio instead of returning JSON as sound', async body => {
+      addMedia('speechify', 'test-simba', 'audio'); addKey('speechify');
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(body));
+      await expect(runSpeech('test-simba', { input: 'Hello' })).rejects.toThrow('Speechify returned');
+    });
+
     it('Cloudflare MeloTTS: base64 audio → audio/mpeg bytes', async () => {
       addMedia('cloudflare', '@cf/myshell-ai/melotts', 'audio');
       addKey('cloudflare', 'acct:tok');
-      globalThis.fetch = vi.fn(async () => jsonResponse({ result: { audio: Buffer.from('MP3').toString('base64') } })) as any;
-      const r = await runSpeech('@cf/myshell-ai/melotts', { input: 'hi' });
+      const fetchMock = vi.fn(async () => jsonResponse({ result: { audio: Buffer.from('MP3').toString('base64') } }));
+      globalThis.fetch = fetchMock as any;
+      const r = await runSpeech('@cf/myshell-ai/melotts', { input: 'hi', voice: 'alloy' });
       expect(r.contentType).toBe('audio/mpeg');
       expect(r.audio.toString()).toBe('MP3');
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body).toMatchObject({ prompt: 'hi', lang: 'en' });
     });
 
-    it('SiliconFlow CosyVoice: raw audio bytes', async () => {
+    it('SiliconFlow CosyVoice: maps OpenAI voices, accepts native names, and defaults unknown names', async () => {
       addMedia('siliconflow', 'FunAudioLLM/CosyVoice2-0.5B', 'audio');
       addKey('siliconflow');
-      globalThis.fetch = vi.fn(async () =>
-        new Response(Buffer.from('COSY'), { status: 200, headers: { 'content-type': 'audio/mpeg' } })) as any;
-      const r = await runSpeech('FunAudioLLM/CosyVoice2-0.5B', { input: 'hi' });
+      const fetchMock = vi.fn(async () =>
+        new Response(Buffer.from('COSY'), { status: 200, headers: { 'content-type': 'audio/mpeg' } }));
+      globalThis.fetch = fetchMock as any;
+      const r = await runSpeech('FunAudioLLM/CosyVoice2-0.5B', { input: 'hi', voice: 'nova' });
+      await runSpeech('FunAudioLLM/CosyVoice2-0.5B', { input: 'hi', voice: 'diana' });
+      await runSpeech('FunAudioLLM/CosyVoice2-0.5B', { input: 'hi', voice: 'not-a-voice' });
       expect(r.contentType).toBe('audio/mpeg');
       expect(r.audio.toString()).toBe('COSY');
+      const voices = fetchMock.mock.calls.map(call =>
+        JSON.parse(String((call[1] as RequestInit).body)).voice,
+      );
+      expect(voices).toEqual([
+        'FunAudioLLM/CosyVoice2-0.5B:anna',
+        'FunAudioLLM/CosyVoice2-0.5B:diana',
+        'FunAudioLLM/CosyVoice2-0.5B:alex',
+      ]);
     });
 
-    it('Pollinations openai-audio: message.audio.data → bytes (keyless)', async () => {
+    it('Pollinations openai-audio: keeps OpenAI voices and defaults unknown names (keyless)', async () => {
       addMedia('pollinations', 'openai-audio', 'audio');
-      globalThis.fetch = vi.fn(async () =>
-        jsonResponse({ choices: [{ message: { audio: { data: Buffer.from('POLLY').toString('base64') } } }] })) as any;
-      const r = await runSpeech('openai-audio', { input: 'hi' });
+      const fetchMock = vi.fn(async () =>
+        jsonResponse({ choices: [{ message: { audio: { data: Buffer.from('POLLY').toString('base64') } } }] }));
+      globalThis.fetch = fetchMock as any;
+      const r = await runSpeech('openai-audio', { input: 'hi', voice: 'shimmer' });
+      await runSpeech('openai-audio', { input: 'hi', voice: 'not-a-voice' });
       expect(r.audio.toString()).toBe('POLLY');
+      const voices = fetchMock.mock.calls.map(call =>
+        JSON.parse(String((call[1] as RequestInit).body)).audio.voice,
+      );
+      expect(voices).toEqual(['shimmer', 'alloy']);
     });
 
-    it('Gemini TTS: base64 PCM wrapped as WAV (RIFF header)', async () => {
+    it('Gemini TTS: maps OpenAI voices and wraps base64 PCM as WAV', async () => {
       addMedia('google', 'gemini-2.5-flash-preview-tts', 'audio');
       addKey('google');
       const pcm = Buffer.from([1, 2, 3, 4]);
-      globalThis.fetch = vi.fn(async () => jsonResponse({
+      const fetchMock = vi.fn(async () => jsonResponse({
         candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: pcm.toString('base64') } }] } }],
-      })) as any;
-      const r = await runSpeech('gemini-2.5-flash-preview-tts', { input: 'hi' });
+      }));
+      globalThis.fetch = fetchMock as any;
+      const r = await runSpeech('gemini-2.5-flash-preview-tts', { input: 'hi', voice: 'alloy' });
       expect(r.contentType).toBe('audio/wav');
       expect(r.audio.subarray(0, 4).toString()).toBe('RIFF');
       expect(r.audio.subarray(8, 12).toString()).toBe('WAVE');
       // header (44) + 4 PCM bytes
       expect(r.audio.length).toBe(48);
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Schedar');
+    });
+
+    it('Gemini TTS: canonicalizes native voices and defaults unknown names', async () => {
+      addMedia('google', 'gemini-2.5-flash-preview-tts', 'audio');
+      addKey('google');
+      const pcm = Buffer.from([1, 2]);
+      const fetchMock = vi.fn(async () => jsonResponse({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;rate=24000', data: pcm.toString('base64') } }] } }],
+      }));
+      globalThis.fetch = fetchMock as any;
+
+      await runSpeech('gemini-2.5-flash-preview-tts', { input: 'hi', voice: 'achernar' });
+      await runSpeech('gemini-2.5-flash-preview-tts', { input: 'hi', voice: 'not-a-voice' });
+
+      const voices = fetchMock.mock.calls.map(call => {
+        const body = JSON.parse(String((call[1] as RequestInit).body));
+        return body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName;
+      });
+      expect(voices).toEqual(['Achernar', 'Kore']);
+    });
+
+    it('uses provider-safe voices during failover without losing a native Gemini voice', async () => {
+      addMedia('cloudflare', '@cf/myshell-ai/melotts', 'audio', 1);
+      addKey('cloudflare', 'acct:tok');
+      addMedia('google', 'gemini-2.5-flash-preview-tts', 'audio', 2);
+      addKey('google');
+      const pcm = Buffer.from([1, 2]);
+      const fetchMock = vi.fn(async (url: string | URL | Request) => {
+        if (String(url).includes('cloudflare.com')) {
+          return new Response('temporarily unavailable', { status: 503 });
+        }
+        return jsonResponse({
+          candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;rate=24000', data: pcm.toString('base64') } }] } }],
+        });
+      });
+      globalThis.fetch = fetchMock as any;
+
+      const result = await runSpeech('auto', { input: 'hi', voice: 'achernar' });
+
+      expect(result.platform).toBe('google');
+      const cloudflareBody = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      const googleBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+      expect(cloudflareBody.lang).toBe('en');
+      expect(googleBody.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Achernar');
     });
 
     it('custom audio models call the bound OpenAI-compatible endpoint', async () => {

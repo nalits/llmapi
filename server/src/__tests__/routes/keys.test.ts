@@ -2,12 +2,14 @@ import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
+import { decrypt } from '../../lib/crypto.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -31,7 +33,8 @@ async function multipartRequest(
   field: 'file' | 'files',
   files: Array<{ filename: string; content: string; type?: string }>,
 ) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
   const form = new FormData();
@@ -130,12 +133,35 @@ describe('Keys API', () => {
     expect(body.notice ?? null).toBeNull();
   });
 
+  it('POST /api/keys accepts the modelscope platform (#581)', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'modelscope',
+      key: 'ms-test-invalid-not-a-real-token',
+      label: 'ModelScope test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe('modelscope');
+    // Catalog rows land only after community testing (#581), so a fresh DB
+    // has no modelscope models and the no-catalog-models notice is expected.
+    expect(body.modelsAvailable).toBe(0);
+  });
+
   it('POST /api/keys rejects invalid platform', async () => {
     const { status } = await request(app, 'POST', '/api/keys', {
       platform: 'invalid_platform',
       key: 'test',
     });
     expect(status).toBe(400);
+  });
+
+  it.each(['aclide', 'electronhub', 'experiential', 'router9', 'septor', 'clod', 'speechify', 'blaze', 'lucidity', 'airforce', 'dreamprompting', 'waterfall', 'logfare'])('accepts a %s key without seeding gated model rows', async platform => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform, key: 'not-a-real-test-key-12345', label: 'Gateway test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe(platform);
+    expect(body.modelsAvailable).toBe(0);
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ?').get(platform)).toEqual({ n: 0 });
   });
 
   it('POST /api/keys rejects missing key', async () => {
@@ -200,6 +226,88 @@ describe('Keys API', () => {
     const { body: keys } = await request(app, 'GET', '/api/keys');
     expect(keys[0].enabled).toBe(false);
     expect(keys[0].label).toBe('Disabled key');
+  });
+
+  it('PATCH /api/keys/:id replaces the credential without changing its stable identity', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_old_key_123456',
+      label: 'Before',
+    });
+    getDb().prepare(`
+      INSERT INTO rate_limit_cooldowns (platform, model_id, key_id, expires_at_ms)
+      VALUES ('groq', 'llama-3.3-70b', ?, ?)
+    `).run(created.id, Date.now() + 60_000);
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      key: 'gsk_new_key_654321',
+    });
+
+    expect(status).toBe(200);
+    expect(body.maskedKey).toContain('gsk_new_key_654321'.slice(-4));
+    const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('gsk_new_key_654321');
+    expect(row.platform).toBe('groq');
+    expect(row.label).toBe('Before');
+    expect(row.enabled).toBe(1);
+    expect(row.status).toBe('unknown');
+    expect(row.last_checked_at).toBeNull();
+    expect(row.last_health_error).toBeNull();
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM rate_limit_cooldowns WHERE key_id = ?')
+      .get(created.id)).toEqual({ n: 0 });
+  });
+
+  it('PATCH /api/keys/:id preserves a Cloudflare credential when a malformed replacement is submitted', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'cloudflare', key: 'old-account:old-token', label: 'Original',
+    });
+    for (const key of ['token-only', ':token', 'account:', 'account:   ']) {
+      const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key, label: 'Changed' });
+      expect(status).toBe(400);
+    }
+    const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('old-account:old-token');
+    expect(row.label).toBe('Original');
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key: 'new-account:new-token' });
+    expect(status).toBe(200);
+    const updated = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(updated.encrypted_key, updated.iv, updated.auth_tag)).toBe('new-account:new-token');
+  });
+
+  it('PATCH /api/keys/:id leaves health state alone when the submitted key is unchanged', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_same_key_123456',
+    });
+    getDb().prepare(`
+      UPDATE api_keys
+         SET status = 'healthy', last_checked_at = datetime('now'), last_health_error = NULL
+       WHERE id = ?
+    `).run(created.id);
+
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      key: 'gsk_same_key_123456',
+    });
+
+    expect(status).toBe(200);
+    const row = getDb().prepare('SELECT status, last_checked_at FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(row.status).toBe('healthy');
+    expect(row.last_checked_at).toBeTruthy();
+  });
+
+  it('PATCH /api/keys/:id rejects a credential for a keyless provider', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'kilo',
+      key: '',
+    });
+
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      key: 'unexpected-secret',
+    });
+
+    expect(status).toBe(400);
+    const row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('no-key');
   });
 
   it('PATCH /api/keys/:id clears label', async () => {
@@ -294,6 +402,56 @@ describe('Keys API', () => {
       ]);
       expect(malformed.status).toBe(400);
       expect(malformed.body.error.message).toBe('Invalid JSON format');
+    });
+  });
+
+  // #705: the dashboard only ever had the platform-wide switch, which for the
+  // Custom group meant every endpoint the operator runs. These are the two
+  // scopes it now offers, kept honest against each other.
+  describe('enable scope', () => {
+    async function addKey(platform: string, key: string) {
+      const { body } = await request(app, 'POST', '/api/keys', { platform, key });
+      return body.id as number;
+    }
+    const enabledById = async () => {
+      const { body } = await request(app, 'GET', '/api/keys');
+      return Object.fromEntries((body as any[]).map(k => [k.id, k.enabled]));
+    };
+
+    it('PATCH /api/keys/:id disables one key and leaves its siblings alone', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+
+      const { status } = await request(app, 'PATCH', `/api/keys/${first}`, { enabled: false });
+
+      expect(status).toBe(200);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('PATCH /api/keys/platform/:platform still writes every key of that platform', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      const other = await addKey('cerebras', 'csk_other_key_789');
+
+      const { body } = await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      expect(body.updatedKeys).toBe(2);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: false, [other]: true });
+    });
+
+    it('re-enables a single key of a platform that was switched off wholesale', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      await request(app, 'PATCH', `/api/keys/${second}`, { enabled: true });
+
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('404s a key that does not exist', async () => {
+      const { status } = await request(app, 'PATCH', '/api/keys/99999', { enabled: false });
+      expect(status).toBe(404);
     });
   });
 });

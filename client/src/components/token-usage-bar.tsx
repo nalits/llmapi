@@ -1,46 +1,43 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 import { useI18n } from '@/i18n'
+import { buildBudgetLegend } from '@/lib/budget-legend'
 import { formatPercent, formatTokens, platformColors, type TokenUsageData } from '@/lib/routing'
 
-// Legend rows visible while collapsed (~6 rows: 6 × 16px line + 5 × 6px gap).
 const LEGEND_COLLAPSED_PX = 126
 
-// Stacked monthly token-budget bar with a collapsible per-model legend,
-// extracted from FallbackPage.
+// The monthly token budget: a stacked bar of every configured model's remaining
+// allowance, and under it one flat legend of models, smartest first. No
+// provider headers — the provider pool grouping (#1010) made the first thing on
+// the Models page read as "arranged by provider"; pool quota readings live on
+// each model's own page instead.
 export function TokenUsageBar({ data }: { data: TokenUsageData }) {
   const { t } = useI18n()
   const { totalBudget, totalUsed, models } = data
   const remaining = Math.max(0, totalBudget - totalUsed)
   const remainingPct = totalBudget > 0 ? formatPercent(remaining / totalBudget) : '0%'
+  const usedPct = totalBudget > 0 ? Math.min(100, (totalUsed / totalBudget) * 100) : 0
 
-  // Collapse the per-model legend to a few rows; the chevron reveals the rest.
-  // The toggle only appears when the legend actually overflows the collapsed
-  // height (column count — and so row count — depends on viewport width).
+  const { rows, unpublishedCount } = buildBudgetLegend(models, totalBudget)
+
   const [expanded, setExpanded] = useState(false)
   const [collapsible, setCollapsible] = useState(false)
+  // The legend's full height, measured in the effect (refs are not read during
+  // render) so the expanded max-height animates to the real size.
+  const [fullHeight, setFullHeight] = useState<number>()
   const legendRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const el = legendRef.current
     if (!el) return
-    const check = () => setCollapsible(el.scrollHeight > LEGEND_COLLAPSED_PX + 1)
+    const check = () => {
+      setFullHeight(el.scrollHeight)
+      setCollapsible(el.scrollHeight > LEGEND_COLLAPSED_PX + 1)
+    }
     check()
     const ro = new ResizeObserver(check)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [models.length])
-
-  const modelsWithWidth = models.map(m => {
-    const usedTokens = m.used ?? 0
-    const remainingTokens = Math.max(0, m.budget - usedTokens)
-    return {
-      ...m,
-      usedTokens,
-      remainingTokens,
-      widthPct: totalBudget > 0 ? (remainingTokens / totalBudget) * 100 : 0,
-    }
-  })
-  const usedPct = totalBudget > 0 ? Math.min(100, (totalUsed / totalBudget) * 100) : 0
+  }, [rows.length, unpublishedCount])
 
   return (
     <section className="rounded-3xl border bg-card p-5">
@@ -53,16 +50,20 @@ export function TokenUsageBar({ data }: { data: TokenUsageData }) {
           {totalUsed > 0 && (
             <>
               <span className="mx-1.5">·</span>
-              <span className="text-foreground font-medium">{formatTokens(totalUsed)}</span> {t('models.used')}
+              {/* Say out loud what this number counts (#887): it is not the
+                  analytics total, and custom endpoints are in it. */}
+              <span className="cursor-help underline decoration-dotted underline-offset-2" title={t('models.usedScopeHint')}>
+                <span className="text-foreground font-medium">{formatTokens(totalUsed)}</span> {t('models.used')}
+              </span>
             </>
           )}
         </span>
       </div>
 
       <div className="flex h-2.5 rounded-full overflow-hidden bg-muted">
-        {modelsWithWidth.map((m, i) => (
+        {rows.map(m => (
           <div
-            key={i}
+            key={`${m.platform}:${m.modelId ?? m.displayName}`}
             title={`${m.displayName} (${m.platform}): ${formatTokens(m.remainingTokens)} ${t('models.remaining')}, ${formatTokens(m.usedTokens)} ${t('models.used')}`}
             style={{
               width: `${m.widthPct}%`,
@@ -82,29 +83,44 @@ export function TokenUsageBar({ data }: { data: TokenUsageData }) {
       <div
         ref={legendRef}
         className="mt-4 overflow-hidden transition-[max-height] duration-300 ease-in-out"
-        style={collapsible ? { maxHeight: expanded ? legendRef.current?.scrollHeight : LEGEND_COLLAPSED_PX } : undefined}
+        style={collapsible ? { maxHeight: expanded ? fullHeight : LEGEND_COLLAPSED_PX } : undefined}
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-5 gap-y-1.5 text-xs tabular-nums">
-          {modelsWithWidth.map((m, i) => (
-            <div key={i} className="flex items-center gap-2 min-w-0">
+          {rows.map(m => (
+            <div key={`${m.platform}:${m.modelId ?? m.displayName}`} className="flex items-center gap-2 min-w-0">
               <span
                 className="size-2 rounded-sm flex-shrink-0"
                 style={{ backgroundColor: platformColors[m.platform] ?? '#94a3b8' }}
               />
               <span className="truncate">{m.displayName}</span>
               <span className="flex-1" />
-              <span className="font-mono text-muted-foreground">{formatTokens(m.remainingTokens)}</span>
+              {/* remaining / budget: a bare remaining figure gives no sense of
+                  how much of the allowance is gone (#887). */}
+              <span
+                className="font-mono text-muted-foreground"
+                title={t('models.legendRemainingTitle', { name: m.displayName, platform: m.platform })}
+              >
+                {formatTokens(m.remainingTokens)}<span className="mx-0.5">/</span>{formatTokens(m.budget)}
+              </span>
             </div>
           ))}
         </div>
       </div>
+
+      {/* Outside the collapsible box on purpose: it is a summary of what the
+          legend is NOT showing, so it has to stay visible while collapsed. */}
+      {unpublishedCount > 0 && (
+        <p className="mt-1.5 text-xs text-muted-foreground" title={t('models.noPublishedQuotaTitle')}>
+          {t('models.noPublishedQuota', { count: unpublishedCount })}
+        </p>
+      )}
 
       {collapsible && (
         <button
           onClick={() => setExpanded(e => !e)}
           className="mt-2 flex w-full items-center justify-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
         >
-          {expanded ? t('models.showLess') : t('models.showAllModels', { count: models.length })}
+          {expanded ? t('models.showLess') : t('models.showAllModels', { count: rows.length })}
           <ChevronDown className={`size-3.5 transition-transform duration-300 ${expanded ? 'rotate-180' : ''}`} />
         </button>
       )}

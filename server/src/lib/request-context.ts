@@ -19,7 +19,7 @@ export function getCurrentUserId(): number | undefined {
 }
 
 function mintUnifiedKey(): string {
-  return `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+  return `llmapi-${crypto.randomBytes(24).toString('hex')}`;
 }
 
 function claimOrphans(userId: number): void {

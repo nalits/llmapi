@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../../routes/proxy.js';
 import { isProviderBadRequestError } from '../../lib/error-classify.js';
+import { cooldownDecisionForError } from '../../lib/fallback-loop.js';
+import { MODEL_FORBIDDEN_COOLDOWN_MS } from '../../services/ratelimit.js';
 
 describe('isModelAccessForbiddenError (403 model-not-on-tier, drives whole-model skip — issue #256)', () => {
   it('flags a 403 reaching the proxy by message or attached status', () => {
@@ -18,6 +20,59 @@ describe('isModelAccessForbiddenError (403 model-not-on-tier, drives whole-model
     expect(isModelAccessForbiddenError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(false);
     expect(isModelAccessForbiddenError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(false);
   });
+
+  // Issue #618: some providers deny model access with a 400 (or 401) instead of
+  // a 403. Classified transient, those got the 90s bench — and the auto-router
+  // re-picked the same unreachable model the moment it expired, forever, with
+  // an escalating penalty. They must classify as model-inaccessible-for-this-key.
+  it('flags a 400/401 whose body says the key may not access the model (#618)', () => {
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 400: user is not allowed to access model kat-coder-pro-v2.5'),
+      { status: 400 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 400: action plan limited, please upgrade'),
+      { status: 400 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 401: you do not have access to this model'),
+      { status: 401 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(
+      new Error('user is not allowed to access model kat-coder-pro-v2.5'),
+    )).toBe(true);
+  });
+
+  it('still leaves ordinary 400/401 rejections alone', () => {
+    expect(isModelAccessForbiddenError(Object.assign(new Error('Bad Request'), { status: 400 }))).toBe(false);
+    expect(isModelAccessForbiddenError(Object.assign(new Error('Unauthorized'), { status: 401 }))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('401 Unauthorized'))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('400 Bad Request'))).toBe(false);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('Groq API error 400: Failed to call a function. Please adjust your prompt.'),
+      { status: 400 },
+    ))).toBe(false);
+  });
+});
+
+// The loop-level consequence of the classification above: a "not allowed to
+// access" 400 must take the model-forbidden bench (a day, source 'tier'), not
+// the 90s transient one that made the router re-pick it every 90 seconds.
+describe('cooldownDecisionForError on a 400 not-allowed body (#618)', () => {
+  const route = {
+    platform: 'kat', modelId: 'kat-coder-pro-v2.5', modelDbId: 1, keyId: 1,
+    rpdLimit: null, tpdLimit: null,
+  } as any;
+
+  it('benches the model like a 403 instead of the transient ladder', () => {
+    const err = Object.assign(
+      new Error('API error 400: user is not allowed to access model kat-coder-pro-v2.5'),
+      { status: 400 },
+    );
+    const decision = cooldownDecisionForError(route, err);
+    expect(decision.durationMs).toBe(MODEL_FORBIDDEN_COOLDOWN_MS);
+    expect(decision.source).toBe('tier');
+  });
 });
 
 describe('isModelNotFoundError (drives whole-model skip within a request)', () => {
@@ -25,6 +80,17 @@ describe('isModelNotFoundError (drives whole-model skip within a request)', () =
     expect(isModelNotFoundError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(true);
     expect(isModelNotFoundError(new Error('Model not found'))).toBe(true);
     expect(isModelNotFoundError(new Error('No endpoints found for openrouter/minimax/minimax-m2.5:free'))).toBe(true);
+  });
+
+  it('flags a stale/removed model reported as a 400 "No model found" (Routeway) — MODEL-level, not request shape', () => {
+    // "No model found" does NOT contain the substring "not found" (words are
+    // no/model/found), so before the phrase list it slipped through to
+    // isProviderBadRequestError and surfaced as a request-blaming 400.
+    expect(isModelNotFoundError(Object.assign(new Error('Routeway API error 400: No model found: llama-3.3-70b-instruct:free'), { status: 400 }))).toBe(true);
+    expect(isModelNotFoundError(new Error('Groq API error 400: model not found'))).toBe(true);
+    expect(isModelNotFoundError(new Error('Provider API error 400: unknown model'))).toBe(true);
+    expect(isModelNotFoundError(new Error('API error 400: model does not exist'))).toBe(true);
+    expect(isModelNotFoundError(new Error('API error 404: no such model'))).toBe(true);
   });
 
   it('flags 410 Gone (model pulled upstream) by message or attached status — #339', () => {
@@ -99,6 +165,17 @@ describe('isRetryableError', () => {
       expect(isProviderBadRequestError(new Error('400 Bad Request'))).toBe(false);
       expect(isProviderBadRequestError(Object.assign(new Error('Bad Request'), { status: 400 }))).toBe(false);
     });
+
+    it('treats provider API 422s like Mistral validation rejects: retryable, then invalid-request on exhaustion', () => {
+      const err = Object.assign(
+        new Error('Mistral API error 422: Unprocessable Entity'),
+        { status: 422 },
+      );
+      expect(isRetryableError(err)).toBe(true);
+      expect(isProviderBadRequestError(err)).toBe(true);
+      expect(isRetryableError(new Error('Mistral API error 422: tool messages failed validation'))).toBe(true);
+      expect(isProviderBadRequestError(new Error('Mistral API error 422: tool messages failed validation'))).toBe(true);
+    });
   });
 
   describe('403 model not on this key\'s tier fails over instead of 502 (issue #256)', () => {
@@ -133,6 +210,31 @@ describe('isRetryableError', () => {
       expect(isPaymentRequiredError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(true);
       expect(isPaymentRequiredError(new Error('429 Too Many Requests'))).toBe(false);
       expect(isPaymentRequiredError(new Error('503 Service Unavailable'))).toBe(false);
+    });
+
+    // #1277 follow-up: the digits 402 inside a token count or id are not a
+    // status. The 402 bench takes the key off every model of the platform for
+    // a day, so these false positives emptied whole providers.
+    it('isPaymentRequiredError ignores 402 inside other numbers and under another status', () => {
+      for (const message of [
+        'groq API error 413: Request too large. Limit 30000, Requested 34026',
+        'openrouter API error 429: rate limit, 14023 tokens used',
+        'provider API error 500: upstream request id 8f402ab',
+        'ACLIDE API error 400: max_tokens 402 is below the minimum',
+        'timeout after 4.402s',
+      ]) {
+        expect(isPaymentRequiredError(new Error(message)), message).toBe(false);
+      }
+      expect(isPaymentRequiredError(Object.assign(new Error('Requested 402 tokens'), { status: 413 }))).toBe(false);
+    });
+
+    it('isPaymentRequiredError still catches every real out-of-credits shape', () => {
+      expect(isPaymentRequiredError(new Error('402 Payment Required'))).toBe(true);
+      expect(isPaymentRequiredError(new Error('upstream returned 402'))).toBe(true);
+      expect(isPaymentRequiredError(Object.assign(new Error('no credits left'), { status: 402 }))).toBe(true);
+      expect(isPaymentRequiredError(new Error('Pollinations API error 402: insufficient credit'))).toBe(true);
+      expect(isPaymentRequiredError(new Error('provider API error 429: insufficient balance (1008)'))).toBe(true);
+      expect(isPaymentRequiredError(new Error('openai API error 429: insufficient_quota'))).toBe(true);
     });
   });
 
