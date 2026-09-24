@@ -63,6 +63,7 @@ import { withKeyProxy } from './proxy.js';
 import { getEndpointTimeBudgetMs } from './ttfb-budget.js';
 import { randomUUID } from 'node:crypto';
 import { getClientContext } from './client-context.js';
+import { getCurrentUserAccount } from './request-context.js';
 import {
   beginRequest,
   finishRequest,
@@ -1314,11 +1315,17 @@ export async function runFallbackLoop(hooks: FallbackHooks): Promise<void> {
   // generation observation still parents beneath it. Returns undefined when this
   // request was (globally) sampled out or observability is disabled — the loop
   // then runs byte-for-byte as before, and the surface never notices.
+  const client = getClientContext();
+  const account = getCurrentUserAccount();
   const obs = beginRequest({
     surface: hooks.logIdentity?.surface ?? 'unidentified',
     requestId: hooks.logIdentity?.requestId ?? randomUUID(),
     requestedModel: hooks.logIdentity?.requestedModel,
-    clientAgent: getClientContext().agent,
+    clientAgent: client.agent,
+    clientIp: client.ip,
+    userAgent: client.userAgent,
+    accountId: account?.userId,
+    accountEmail: account?.email,
     sampleRate: getObservabilityConfig()?.sampleRate ?? 1,
     inboundHeaders: hooks.traceContextHeaders,
   });
@@ -1491,7 +1498,11 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
       // parameter threading.
       outcome = await withKeyProxy(route.proxyUrl, () => {
         const obsReq = getRequestObservability();
-        if (obsReq) obsReq.ctx.attempt = attempt + 1;
+        if (obsReq) {
+          obsReq.ctx.attempt = attempt + 1;
+          obsReq.ctx.providerKeyLabel = route.keyLabel ?? null;
+          obsReq.ctx.providerKeyId = route.keyId;
+        }
         return hooks.dispatch(route, attempt, { disarmHedge });
       });
     } catch (err: any) {

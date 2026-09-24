@@ -9,12 +9,28 @@
 //   langfuse.observation.model.name     → served model id
 //   langfuse.observation.model.parameters → sampling/model parameters
 //   langfuse.observation.usage_details  → { input, output, total } tokens
+//   langfuse.user.id                    → llmapi account (email, else user:<id>)
+//   langfuse.trace.metadata.*           → caller IP / account / UA on the trace
+//   langfuse.observation.metadata.*     → same plus the provider key on each hop
 // GenAI semantic-convention attrs give the same data its portable spelling.
-// No user identity is ever captured.
 
 export type UsageSource = 'provider' | 'estimated';
 
-export interface GenerationAttributes {
+export interface CallerMetadata {
+  /** Socket / trust-proxy client IP. Null when REQUEST_ANALYTICS_LOG_CLIENT=false. */
+  clientIp?: string | null;
+  userAgent?: string | null;
+  clientAgent?: string | null;
+  /** Dashboard / API account id (multi-user). */
+  accountId?: number;
+  /** users.email for that account, when readable. */
+  accountEmail?: string;
+  /** Operator-assigned api_keys.label for the key this hop used. */
+  providerKeyLabel?: string | null;
+  providerKeyId?: number;
+}
+
+export interface GenerationAttributes extends CallerMetadata {
   operation: 'chat' | 'stream';
   platform: string;
   model: string; // routed/served model id, as sent upstream
@@ -30,6 +46,43 @@ export interface GenerationAttributes {
   finishReasons?: string[];
   ttfbMs?: number;
   latencyMs?: number;
+}
+
+function setIfPresent(attrs: Record<string, number | string>, key: string, value: string | number | null | undefined): void {
+  if (value == null || value === '') return;
+  attrs[key] = value;
+}
+
+/** Caller identity + request metadata. Applied on both the root request span
+ *  and each generation so Langfuse shows IP/account on the observation itself. */
+export function callerAttrs(input: CallerMetadata): Record<string, number | string> {
+  const attrs: Record<string, number | string> = {};
+  const account = input.accountEmail || (input.accountId != null ? `user:${input.accountId}` : undefined);
+  setIfPresent(attrs, 'langfuse.user.id', account);
+  setIfPresent(attrs, 'user.id', account);
+  setIfPresent(attrs, 'client.address', input.clientIp);
+  setIfPresent(attrs, 'user_agent.original', input.userAgent);
+  setIfPresent(attrs, 'langfuse.trace.metadata.client_ip', input.clientIp);
+  setIfPresent(attrs, 'langfuse.trace.metadata.account', account);
+  setIfPresent(attrs, 'langfuse.observation.metadata.client_ip', input.clientIp);
+  setIfPresent(attrs, 'langfuse.observation.metadata.account', account);
+  setIfPresent(attrs, 'langfuse.observation.metadata.user_agent', input.userAgent);
+  setIfPresent(attrs, 'langfuse.observation.metadata.client_agent', input.clientAgent);
+  setIfPresent(attrs, 'freellmapi.client_ip', input.clientIp);
+  setIfPresent(attrs, 'freellmapi.account', account);
+  setIfPresent(attrs, 'freellmapi.user_agent', input.userAgent);
+  if (input.accountId != null) {
+    attrs['langfuse.trace.metadata.account_id'] = input.accountId;
+    attrs['langfuse.observation.metadata.account_id'] = input.accountId;
+    attrs['freellmapi.account_id'] = input.accountId;
+  }
+  setIfPresent(attrs, 'langfuse.observation.metadata.provider_key', input.providerKeyLabel);
+  setIfPresent(attrs, 'freellmapi.provider_key', input.providerKeyLabel);
+  if (input.providerKeyId != null) {
+    attrs['langfuse.observation.metadata.provider_key_id'] = input.providerKeyId;
+    attrs['freellmapi.provider_key_id'] = input.providerKeyId;
+  }
+  return attrs;
 }
 
 const MAX_VALUE_LENGTH = 200_000;
@@ -69,6 +122,7 @@ export function startAttrs(input: GenerationAttributes): Record<string, number |
   };
   if (input.requestedModel) attrs['freellmapi.requested_model'] = input.requestedModel;
   if (input.attempt != null) attrs['freellmapi.attempt'] = input.attempt;
+  Object.assign(attrs, callerAttrs(input));
   attrs['gen_ai.operation.name'] = input.operation;
   if (input.samplingParameters && Object.keys(input.samplingParameters).length > 0) {
     const params = truncateJson(input.samplingParameters, 4096);

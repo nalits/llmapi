@@ -31,6 +31,8 @@ export { observeGeneration, type GenerationHandle, type ObserveGenerationInput }
 export { shouldSample } from './sampling.js';
 export {
   generationSpanName,
+  callerAttrs,
   type GenerationAttributes,
+  type CallerMetadata,
   type UsageSource,
 } from './attributes.js';

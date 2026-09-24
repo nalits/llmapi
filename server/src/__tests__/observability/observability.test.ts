@@ -15,7 +15,7 @@ import {
   type LangfuseObservabilityConfig,
 } from '../../observability/index.js';
 import { langfuseOtelEndpoint, hasCompleteLangfuseCredentials, loadObservabilityConfig } from '../../observability/config.js';
-import { startAttrs, finishAttrs, errorAttrs } from '../../observability/attributes.js';
+import { startAttrs, finishAttrs, errorAttrs, callerAttrs } from '../../observability/attributes.js';
 
 // The observability tests run against the no-op OTEL tracer (no SDK started):
 // every span is non-recording, which is exactly the fail-open posture the
@@ -121,6 +121,38 @@ describe('startAttrs', () => {
     expect(attrs['gen_ai.system']).toBe('groq');
     expect(attrs['freellmapi.attempt']).toBe(2);
     expect(attrs['freellmapi.endpoint']).toBe('chat/completions');
+  });
+
+  it('stamps caller IP, account, and provider key onto Langfuse metadata', () => {
+    const attrs = startAttrs({
+      operation: 'chat',
+      platform: 'groq',
+      model: 'llama-3.3-70b',
+      endpoint: 'chat/completions',
+      clientIp: '203.0.113.9',
+      userAgent: 'curl/8.6.0',
+      clientAgent: 'curl',
+      accountId: 7,
+      accountEmail: 'ops@example.com',
+      providerKeyLabel: 'Work account',
+      providerKeyId: 42,
+    });
+    expect(attrs['langfuse.user.id']).toBe('ops@example.com');
+    expect(attrs['user.id']).toBe('ops@example.com');
+    expect(attrs['client.address']).toBe('203.0.113.9');
+    expect(attrs['langfuse.trace.metadata.client_ip']).toBe('203.0.113.9');
+    expect(attrs['langfuse.observation.metadata.account']).toBe('ops@example.com');
+    expect(attrs['langfuse.observation.metadata.account_id']).toBe(7);
+    expect(attrs['langfuse.observation.metadata.provider_key']).toBe('Work account');
+    expect(attrs['freellmapi.provider_key_id']).toBe(42);
+    expect(attrs['user_agent.original']).toBe('curl/8.6.0');
+  });
+
+  it('falls back to user:<id> when the account has no email', () => {
+    const attrs = callerAttrs({ accountId: 3 });
+    expect(attrs['langfuse.user.id']).toBe('user:3');
+    expect(attrs['client.address']).toBeUndefined();
+    expect(attrs['langfuse.observation.metadata.provider_key']).toBeUndefined();
   });
 });
 
@@ -296,12 +328,18 @@ describe('beginRequest / observeGeneration fail-open', () => {
       requestId: 'req-lifecycle',
       requestedModel: 'test-model',
       clientAgent: 'curl',
+      clientIp: '198.51.100.4',
+      userAgent: 'curl/8.6.0',
+      accountId: 1,
+      accountEmail: 'ops@example.com',
       sampleRate: 1,
     });
     if (!obs) throw new Error('expected a sampled handle');
     withRequestObservability(obs, () => {
       const handle = observeGeneration({ operation: 'chat', platform: 'openrouter', model: 'x/y', endpoint: 'chat/completions' });
       expect(getRequestObservability()?.ctx.requestId).toBe('req-lifecycle');
+      expect(getRequestObservability()?.ctx.clientIp).toBe('198.51.100.4');
+      expect(getRequestObservability()?.ctx.accountEmail).toBe('ops@example.com');
       handle.markFirstByte();
       handle.end({ output: { choices: [] }, usage: { input: 1, output: 2, total: 3 }, finishReasons: ['stop'] });
       finishRequest(obs);
@@ -347,6 +385,8 @@ describe('runFallbackLoop observability wiring', () => {
       route: fakeRoute,
       async dispatch() {
         attemptSeen = getRequestObservability()?.ctx.attempt;
+        expect(getRequestObservability()?.ctx.providerKeyId).toBe(1);
+        expect(getRequestObservability()?.ctx.providerKeyLabel).toBeNull();
         return 'done' as DispatchOutcome;
       },
       ...noopHooks(),

@@ -18,6 +18,19 @@ export function getCurrentUserId(): number | undefined {
   return storage.getStore()?.userId;
 }
 
+/** Bound account for the current request: user id plus email when the users
+ *  row is readable. Fail-open — a missing/unready DB still returns the id. */
+export function getCurrentUserAccount(): { userId: number; email?: string } | undefined {
+  const userId = getCurrentUserId();
+  if (userId == null) return undefined;
+  try {
+    const row = getDb().prepare('SELECT email FROM users WHERE id = ?').get(userId) as { email: string } | undefined;
+    return { userId, email: row?.email };
+  } catch {
+    return { userId };
+  }
+}
+
 function mintUnifiedKey(): string {
   return `llmapi-${crypto.randomBytes(24).toString('hex')}`;
 }

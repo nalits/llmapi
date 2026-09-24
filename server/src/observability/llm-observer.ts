@@ -89,6 +89,13 @@ export function observeGeneration(input: ObserveGenerationInput): GenerationHand
       attempt,
       input: captureInput ? input.input : undefined,
       samplingParameters: input.samplingParameters,
+      clientIp: request.ctx.clientIp,
+      userAgent: request.ctx.userAgent,
+      clientAgent: request.ctx.clientAgent,
+      accountId: request.ctx.accountId,
+      accountEmail: request.ctx.accountEmail,
+      providerKeyLabel: request.ctx.providerKeyLabel,
+      providerKeyId: request.ctx.providerKeyId,
     };
     span = tracer.startSpan(generationSpanName(input.platform, input.endpoint), {
       kind: SpanKind.CLIENT,

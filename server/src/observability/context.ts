@@ -10,6 +10,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { context, propagation, ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span } from '@opentelemetry/api';
+import { callerAttrs } from './attributes.js';
 import { getTracer } from './otel.js';
 import { shouldSample } from './sampling.js';
 
@@ -23,6 +24,17 @@ export interface RequestObservabilityContext {
   requestedModel?: string;
   /** Classified client agent (from client-classifier.ts); never the raw UA. */
   clientAgent: string | null;
+  /** Caller IP (trust-proxy aware). Null when client logging is opted out. */
+  clientIp: string | null;
+  /** Raw User-Agent, truncated by client-context. */
+  userAgent: string | null;
+  /** llmapi account id bound for this request (multi-user). */
+  accountId?: number;
+  /** users.email for that account, when readable. */
+  accountEmail?: string;
+  /** Provider key label for the hop about to dispatch (set by the fallback loop). */
+  providerKeyLabel?: string | null;
+  providerKeyId?: number;
   /** Trace-level sampling verdict shared by every span of this request. */
   sampled: boolean;
   /** 1-based fallback attempt index, set by the loop right before each dispatch. */
@@ -46,6 +58,10 @@ export interface BeginRequestOptions {
   requestId: string;
   requestedModel?: string;
   clientAgent?: string | null;
+  clientIp?: string | null;
+  userAgent?: string | null;
+  accountId?: number;
+  accountEmail?: string;
   sampleRate: number;
   /** Inbound request headers (Express req.headers — lowercase keys). When the
    *  caller carries a W3C traceparent/tracestate the request span continues that
@@ -62,21 +78,14 @@ export function beginRequest(opts: BeginRequestOptions): RequestObservability | 
   const tracer = getTracer();
   const parentCtx = opts.inboundHeaders ? propagation.extract(ROOT_CONTEXT, opts.inboundHeaders) : ROOT_CONTEXT;
 
+  const ctxFields = requestContextFields(opts);
   if (sampled) {
     const span = tracer.startSpan('freellmapi.request', {
-      attributes: buildRequestAttributes(opts.surface, opts.requestId, opts.requestedModel, opts.clientAgent),
+      attributes: buildRequestAttributes(ctxFields),
     }, parentCtx);
     const activeContext = trace.setSpan(parentCtx, span);
     return {
-      ctx: {
-        surface: opts.surface,
-        requestId: opts.requestId,
-        requestedModel: opts.requestedModel,
-        clientAgent: opts.clientAgent ?? null,
-        sampled,
-        attempt: 0,
-        startedAt: opts.startedAt ?? Date.now(),
-      },
+      ctx: { ...ctxFields, sampled, attempt: 0, startedAt: opts.startedAt ?? Date.now() },
       span,
       activeContext,
     };
@@ -85,15 +94,7 @@ export function beginRequest(opts: BeginRequestOptions): RequestObservability | 
   // Unsampled: still track the request so generation observers can no-op cheaply
   // and the attempt counter stays meaningful. No span exists to keep active.
   return {
-    ctx: {
-      surface: opts.surface,
-      requestId: opts.requestId,
-      requestedModel: opts.requestedModel,
-      clientAgent: opts.clientAgent ?? null,
-      sampled,
-      attempt: 0,
-      startedAt: opts.startedAt ?? Date.now(),
-    },
+    ctx: { ...ctxFields, sampled, attempt: 0, startedAt: opts.startedAt ?? Date.now() },
     span: undefined as unknown as Span,
     activeContext: parentCtx,
   };
@@ -127,17 +128,28 @@ export function finishRequest(handle: RequestObservability, opts: FinishRequestO
   handle.span.end();
 }
 
-function buildRequestAttributes(
-  surface: string,
-  requestId: string,
-  requestedModel?: string,
-  clientAgent?: string | null,
-): Record<string, string> {
-  const attrs: Record<string, string> = {
-    'freellmapi.surface': surface,
-    'freellmapi.request_id': requestId,
+function requestContextFields(opts: BeginRequestOptions): Omit<RequestObservabilityContext, 'sampled' | 'attempt' | 'startedAt'> {
+  return {
+    surface: opts.surface,
+    requestId: opts.requestId,
+    requestedModel: opts.requestedModel,
+    clientAgent: opts.clientAgent ?? null,
+    clientIp: opts.clientIp ?? null,
+    userAgent: opts.userAgent ?? null,
+    accountId: opts.accountId,
+    accountEmail: opts.accountEmail,
   };
-  if (requestedModel) attrs['freellmapi.requested_model'] = requestedModel;
-  if (clientAgent) attrs['freellmapi.client_agent'] = clientAgent;
+}
+
+function buildRequestAttributes(
+  fields: Omit<RequestObservabilityContext, 'sampled' | 'attempt' | 'startedAt'>,
+): Record<string, string | number> {
+  const attrs: Record<string, string | number> = {
+    'freellmapi.surface': fields.surface,
+    'freellmapi.request_id': fields.requestId,
+    ...callerAttrs(fields),
+  };
+  if (fields.requestedModel) attrs['freellmapi.requested_model'] = fields.requestedModel;
+  if (fields.clientAgent) attrs['freellmapi.client_agent'] = fields.clientAgent;
   return attrs;
 }
