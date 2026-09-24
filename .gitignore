@@ -14,6 +14,7 @@ server/data/
 .env
 .env.local
 deploy/.env
+/tunnel-client.yaml
 .DS_Store
 
 # TypeScript incremental build cache

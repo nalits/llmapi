@@ -404,6 +404,7 @@ export const platformColors: Record<string, string> = {
   cerebras:    '#8b5cf6',
   sail:        '#0ea5e9',
   aclide:      '#6366f1',
+  speka:       '#0d9488',
   moondream:   '#6d5dfc',
   electronhub: '#6366f1',
   experiential: '#14b8a6',
@@ -498,6 +499,16 @@ export function buildGroups(
     groups.sort((a, b) => Number(isGroupDepleted(a.members, rateUsage)) - Number(isGroupDepleted(b.members, rateUsage)))
   }
   return groups
+}
+
+// Clamp a typed 1-based rank (#1317) to a valid 0-based index into the visible
+// chain. Jump-to-rank edits clamp instead of erroring: 1 means "front", a
+// number past the end means "last", and garbage falls back to staying put.
+export function clampRankToIndex(toRank: number, length: number): number {
+  if (!Number.isFinite(toRank)) return -1
+  const i = Math.trunc(toRank) - 1
+  if (i < 0) return 0
+  return i > length - 1 ? length - 1 : i
 }
 
 /**

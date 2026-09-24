@@ -167,6 +167,8 @@ instead of duplicated.
 
 ```json
 {
+  "admin": { "email": "ops@example.com", "password": "change-me-min-8-chars" },
+  "license": "premium license key from freellmapi.co",
   "keys": [
     { "platform": "groq", "key": "gsk_...", "label": "main" },
     { "platform": "google", "key": "AIza...", "enabled": true }
@@ -192,6 +194,24 @@ instead of duplicated.
   "routing": { "strategy": "balanced" }
 }
 ```
+
+Two optional top-level fields cover first-run provisioning:
+
+- **`admin`** creates the first dashboard account, but only while no account
+  exists — a claimed install ignores the entry with a warning, so the config
+  can never take it over. Because the config is applied before the HTTP
+  listener starts, an `admin` entry also closes the unauthenticated
+  first-run setup window entirely: no setup code is minted and
+  `POST /api/auth/setup` answers 409 from the first request on.
+- **`license`** is a Premium key from freellmapi.co. It is validated against
+  the license service before being stored — the same contract as the
+  dashboard's Premium page — then a live-tier catalog sync starts right away.
+  Activation runs in the background so an unreachable license service never
+  delays boot; a stored key identical to the configured one short-circuits
+  before any network call, and a changed key re-activates (rotation).
+
+The config carries plaintext secrets (provider keys, the admin password, the
+license key), so protect the file or env value exactly like `ENCRYPTION_KEY`.
 
 If two custom endpoints serve the same model id, add `"endpoint"` to a `models`
 or `fallback` entry to say which one you mean — the endpoint's URL, or the short
