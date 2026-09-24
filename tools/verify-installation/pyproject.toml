@@ -1,0 +1,10 @@
+[project]
+name = "freellmapi-verify-installation"
+version = "0.1.0"
+description = "Smoke test client to verify the FreeLLMAPI + Langfuse installation stays stable"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+# No external dependencies — the client uses only the Python standard library.
+# `uv run` still creates an isolated virtualenv for it.

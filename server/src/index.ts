@@ -10,6 +10,7 @@ import { startCustomModelSync } from './services/custom-model-sync.js';
 import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
+import { initObservability, loadObservabilityConfig, shutdownObservability } from './observability/index.js';
 import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
 import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
 import { startBackupScheduler } from './services/backups.js';
@@ -30,6 +31,27 @@ async function main() {
   const config = loadConfig();
   const { port: PORT, host: HOST } = config;
   warnOnEnvDrift();
+
+  // Observability is opt-in, fail-open, additive: it must never change how
+  // requests are handled. Disabled or incomplete credentials log a warning (or
+  // nothing) and the gateway serves exactly as before.
+  const startedObservability = initObservability(loadObservabilityConfig());
+
+  // Only when the SDK is actually running do we flag for a bounded flush on
+  // SIGTERM/SIGINT — last spans shouldn't vanish with the process. When
+  // observability is off these handlers are not registered and shutdown behaves
+  // exactly as it always did.
+  if (startedObservability.started) {
+    let flushing = false;
+    const gracefulExit = (signal: string) => {
+      if (flushing) return;
+      flushing = true;
+      console.log(`[observability] ${signal} — flushing spans before exit`);
+      void shutdownObservability().finally(() => process.exit(0));
+    };
+    process.once('SIGTERM', () => gracefulExit('SIGTERM'));
+    process.once('SIGINT', () => gracefulExit('SIGINT'));
+  }
 
   // Install first so a late provider socket reset (undici HTTP/2 error with no
   // listener) can't take the proxy down. Genuine bugs still exit 1.
