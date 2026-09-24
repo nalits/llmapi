@@ -61,6 +61,15 @@ import { getRequestTrace, newRequestTrace, runWithRequestTrace, type AttemptOutc
 import { logRequest, persistRequestAttempts } from './request-log.js';
 import { withKeyProxy } from './proxy.js';
 import { getEndpointTimeBudgetMs } from './ttfb-budget.js';
+import { randomUUID } from 'node:crypto';
+import { getClientContext } from './client-context.js';
+import {
+  beginRequest,
+  finishRequest,
+  getObservabilityConfig,
+  getRequestObservability,
+  withRequestObservability,
+} from '../observability/index.js';
 
 // Every surface caps failover hops at the same number.
 export const FALLBACK_MAX_RETRIES = 20;
@@ -1223,6 +1232,12 @@ export interface FallbackHooks {
   // mutate it, and the surface's route() reads it to exclude failed keys/models.
   state: FallbackState;
 
+  // Observability: the inbound W3C trace headers (Express req.headers — lowercase
+  // keys) so a traced request can continue its caller's trace. Absent = the
+  // gateway roots its own trace. Deliberately typed broadly: the loop only hands
+  // it to the OTel extractor and never reads individual values.
+  traceContextHeaders?: Record<string, unknown>;
+
   /**
    * Pick a route for this attempt. Reads state.skipKeys / state.skipModels /
    * state.skipPlatforms.
@@ -1291,10 +1306,30 @@ export async function runFallbackLoop(hooks: FallbackHooks): Promise<void> {
   // `requests` row was written (a pure abort writes its own 'canceled' row,
   // so its trace persists too).
   const trace = newRequestTrace();
+  // Observability: begin the request trace once — sampling is decided HERE (one
+  // verdict for the whole ladder, so a failover chain is never torn in half),
+  // and any inbound W3C traceparent/tracestate continues the caller's trace so
+  // gateway hops show up as child spans of the caller's own telemetry. The root
+  // span stays open for the whole ladder INCLUDING streaming, so the last
+  // generation observation still parents beneath it. Returns undefined when this
+  // request was (globally) sampled out or observability is disabled — the loop
+  // then runs byte-for-byte as before, and the surface never notices.
+  const obs = beginRequest({
+    surface: hooks.logIdentity?.surface ?? 'unidentified',
+    requestId: hooks.logIdentity?.requestId ?? randomUUID(),
+    requestedModel: hooks.logIdentity?.requestedModel,
+    clientAgent: getClientContext().agent,
+    sampleRate: getObservabilityConfig()?.sampleRate ?? 1,
+    inboundHeaders: hooks.traceContextHeaders,
+  });
   try {
-    await runWithRequestTrace(trace, () => runFallbackLoopAttempts(hooks, trace));
+    await runWithRequestTrace(trace, () => {
+      if (obs) return withRequestObservability(obs, () => runFallbackLoopAttempts(hooks, trace));
+      return runFallbackLoopAttempts(hooks, trace);
+    });
   } finally {
     persistRequestAttempts(trace);
+    if (obs) finishRequest(obs);
   }
 }
 
@@ -1450,7 +1485,15 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
       // otherwise the global proxy / direct path applies as before. The URL
       // arrives already decrypted on the route (services/router.ts), so an
       // attempt costs nothing extra — no query, no decrypt.
-      outcome = await withKeyProxy(route.proxyUrl, () => hooks.dispatch(route, attempt, { disarmHedge }));
+      // Observability: publish the 1-based attempt ordinal onto the request
+      // context before dispatch, so the generation observer created inside the
+      // provider can attribute which hop of the ladder this is without any
+      // parameter threading.
+      outcome = await withKeyProxy(route.proxyUrl, () => {
+        const obsReq = getRequestObservability();
+        if (obsReq) obsReq.ctx.attempt = attempt + 1;
+        return hooks.dispatch(route, attempt, { disarmHedge });
+      });
     } catch (err: any) {
       // Client-caused abort: the composed fetch signal fired because OUR
       // client hung up mid-attempt (see newClientAbortError). Not a

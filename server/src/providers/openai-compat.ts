@@ -15,6 +15,7 @@ import { recordQuotaObservationsFromResponse, type QuotaObservationContext } fro
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { isAbortLikeError } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
+import { observeGeneration } from '../observability/index.js';
 
 /** Hosts that ARE Moonshot's OpenAI-compatible API (api.moonshot.ai,
  * api.moonshot.cn, api.kimi.com and their subdomains). */
@@ -273,6 +274,37 @@ export class OpenAICompatProvider extends BaseProvider {
     quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
     const sampling = this.samplingForModel(modelId, options);
+    const framedMessages = this.messagesForPlatform(messages, modelId);
+    const payload = {
+      model: modelId,
+      messages: framedMessages,
+      temperature: sampling.temperature,
+      max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+      top_p: sampling.topP,
+      stop: options?.stop,
+      tools: options?.tools,
+      tool_choice: options?.tool_choice,
+      parallel_tool_calls: this.resolveParallelToolCalls(options),
+      ...extendedBodyParams(this.platform, options),
+    };
+    // Observability: one generation observation per real upstream attempt —
+    // including a rescued tool-use-failed body, which is an answer, just not
+    // the provider's. Fail-open: disabled, sampled out, or no active request
+    // context → inert handle, request path byte-for-byte unchanged.
+    const observable = observeGeneration({
+      operation: 'chat',
+      platform: this.platform,
+      model: modelId,
+      endpoint: 'chat/completions',
+      input: payload,
+      samplingParameters: {
+        temperature: sampling.temperature,
+        ...(payload.top_p != null ? { top_p: payload.top_p } : {}),
+        ...(payload.max_tokens != null ? { max_tokens: payload.max_tokens } : {}),
+        ...(payload.stop != null ? { stop: typeof payload.stop === 'string' ? payload.stop : payload.stop.join(',') } : {}),
+      },
+    });
+    try {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -280,18 +312,7 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages: this.messagesForPlatform(messages, modelId),
-        temperature: sampling.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
-        top_p: sampling.topP,
-        stop: options?.stop,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-        ...extendedBodyParams(this.platform, options),
-      }),
+      body: JSON.stringify(payload),
       // 'request' bounds: the deadline covers the body read too, so a 200
       // whose body hangs aborts instead of stalling res.json() forever.
     }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
@@ -319,6 +340,7 @@ export class OpenAICompatProvider extends BaseProvider {
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         };
         out._routed_via = { platform: this.platform, model: modelId };
+        observable.end({ output: out, usage: { input: out.usage.prompt_tokens, output: out.usage.completion_tokens, total: out.usage.total_tokens }, responseModel: out.model, finishReasons: ['tool_calls'], usageSource: 'provider' });
         return out;
       }
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
@@ -391,7 +413,22 @@ export class OpenAICompatProvider extends BaseProvider {
       throw new Error(`${this.name} API error 402: insufficient credit (upstream returned 200 with an out-of-credits notice): ${creditsNotice}`);
     }
     data._routed_via = { platform: this.platform, model: modelId };
+    observable.end({
+      output: data,
+      usage: {
+        input: data.usage?.prompt_tokens,
+        output: data.usage?.completion_tokens,
+        total: data.usage?.total_tokens,
+      },
+      usageSource: data.usage?.estimated === true ? 'estimated' : 'provider',
+      responseModel: data.model,
+      finishReasons: (data.choices ?? []).map(c => c.finish_reason).filter((f): f is string => typeof f === 'string'),
+    });
     return data;
+    } catch (err: any) {
+      observable.error(err, typeof err?.status === 'number' ? err.status : undefined);
+      throw err;
+    }
   }
 
   async *streamChatCompletion(
@@ -402,6 +439,72 @@ export class OpenAICompatProvider extends BaseProvider {
     quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
     const sampling = this.samplingForModel(modelId, options);
+    const framedMessages = this.messagesForPlatform(messages, modelId);
+    const payload = {
+      model: modelId,
+      messages: framedMessages,
+      temperature: sampling.temperature,
+      max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+      top_p: sampling.topP,
+      stop: options?.stop,
+      tools: options?.tools,
+      tool_choice: options?.tool_choice,
+      parallel_tool_calls: this.resolveParallelToolCalls(options),
+      ...extendedBodyParams(this.platform, options),
+      stream: true,
+      stream_options: options?.stream_options,
+    };
+    // One generation observation per streamed attempt. Output is accumulated
+    // from the chunks (bounded) but this never replaces the real stream —
+    // chunks pass through to the client untouched, byte-for-byte.
+    const observable = observeGeneration({
+      operation: 'stream',
+      platform: this.platform,
+      model: modelId,
+      endpoint: 'chat/completions',
+      input: payload,
+      samplingParameters: {
+        temperature: sampling.temperature,
+        ...(payload.top_p != null ? { top_p: payload.top_p } : {}),
+        ...(payload.max_tokens != null ? { max_tokens: payload.max_tokens } : {}),
+        ...(payload.stop != null ? { stop: typeof payload.stop === 'string' ? payload.stop : payload.stop.join(',') } : {}),
+      },
+    });
+    // Streaming observation state + guards. Declared before the `try` so the
+    // outer catch can reach them even when the fetch itself throws (TDZ-safe).
+    const OUTPUT_CAP = 50_000;
+    let firstByteMarked = false;
+    let responseModel: string | undefined;
+    let lastFinishReason: string | null = null;
+    let usageInput: number | undefined;
+    let usageOutput: number | undefined;
+    let usageTotal: number | undefined;
+    let usageEstimated = false;
+    let capturedOutput = '';
+    let outputTruncated = false;
+    let ended = false;
+    const endOk = (overrides: Record<string, unknown> = {}) => {
+      if (ended) return;
+      ended = true;
+      observable.end({
+        output: outputTruncated ? `${capturedOutput}[…truncated]` : (capturedOutput.length > 0 ? capturedOutput : undefined),
+        usage: usageInput != null || usageOutput != null
+          ? { input: usageInput, output: usageOutput, total: usageTotal }
+          : undefined,
+        usageSource: usageInput == null && usageOutput == null && usageTotal == null
+          ? 'estimated'
+          : usageEstimated ? 'estimated' : 'provider',
+        responseModel,
+        finishReasons: lastFinishReason ? [lastFinishReason] : undefined,
+        ...overrides,
+      });
+    };
+    const endErr = (err: unknown) => {
+      if (ended) return;
+      ended = true;
+      observable.error(err, typeof (err as any)?.status === 'number' ? (err as any).status : undefined);
+    };
+    try {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -409,20 +512,7 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages: this.messagesForPlatform(messages, modelId),
-        temperature: sampling.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
-        top_p: sampling.topP,
-        stop: options?.stop,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-        ...extendedBodyParams(this.platform, options),
-        stream: true,
-        stream_options: options?.stream_options,
-      }),
+      body: JSON.stringify(payload),
       // Default 'headers' bounds: the deadline dies at response headers, and
       // the client signal + stall watchdog own the stream from there.
     }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
@@ -445,6 +535,7 @@ export class OpenAICompatProvider extends BaseProvider {
         yield { ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] };
         yield { ...base, choices: [{ index: 0, delta: { tool_calls: rescued.map((c, i) => ({ index: i, ...c })) as unknown as ChatToolCall[] }, finish_reason: null }] };
         yield { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] };
+        endOk({ responseModel: modelId, finishReasons: ['tool_calls'] });
         return;
       }
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
@@ -453,9 +544,54 @@ export class OpenAICompatProvider extends BaseProvider {
     // First-byte grace (#584): the same chat timeout that bounded the headers
     // also budgets the first stream read — NIM-style providers send SSE
     // headers instantly, then prefill long prompts for minutes.
-    yield* this.guardInBandCreditsError(
+    const src = this.guardInBandCreditsError(
       this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs }),
     );
+    // TTFB on the first content-bearing (or terminal usage) chunk, output
+    // captured up to OUTPUT_CAP, then the observation closed when the stream is.
+    // The `ended` guard keeps exactly ONE terminal call (end / error / an early
+    // consumer .return() on client disconnect) per attempt.
+    try {
+      for await (const chunk of src) {
+        if (!firstByteMarked) {
+          const hasContent = (chunk.choices ?? []).some(c => {
+            const content = (c.delta as { content?: unknown }).content;
+            return typeof content === 'string' && content.length > 0;
+          });
+          if (hasContent || chunk.usage) {
+            firstByteMarked = true;
+            observable.markFirstByte();
+          }
+        }
+        if (typeof chunk.model === 'string') responseModel = chunk.model;
+        for (const c of chunk.choices ?? []) {
+          if (c.finish_reason) lastFinishReason = c.finish_reason;
+          const text = (c.delta as { content?: unknown }).content;
+          if (typeof text === 'string' && capturedOutput.length < OUTPUT_CAP) {
+            const room = OUTPUT_CAP - capturedOutput.length;
+            capturedOutput += text.slice(0, Math.max(0, room));
+            if (room < text.length) outputTruncated = true;
+          }
+        }
+        if (chunk.usage) {
+          usageInput = chunk.usage.prompt_tokens;
+          usageOutput = chunk.usage.completion_tokens;
+          usageTotal = chunk.usage.total_tokens;
+          usageEstimated = chunk.usage.estimated === true;
+        }
+        yield chunk;
+      }
+      endOk();
+    } catch (err: any) {
+      endErr(err);
+      throw err;
+    } finally {
+      endOk(); // covers an early consumer .return() (client disconnect)
+    }
+    } catch (err: any) {
+      endErr(err);
+      throw err;
+    }
   }
 
   /**
